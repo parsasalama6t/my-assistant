@@ -17,6 +17,8 @@ database is in WAL mode), and every model turn runs under `turn_lock`.
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 import logging
 import queue
 import signal
@@ -220,6 +222,21 @@ class Daemon:
                 return None
         allowed = channel.is_allowed(msg.chat_id)
         text = (msg.text or "").strip()
+        try:
+            store.set_state(
+                f"{msg.channel}.last_inbound",
+                json.dumps(
+                    {
+                        "chat_id": msg.chat_id,
+                        "sender": msg.sender,
+                        "text": text[:60],
+                        "allowed": allowed,
+                        "at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                    }
+                ),
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must never break handling
+            pass
         if not text:
             return None
         if allowed:
@@ -287,15 +304,19 @@ class Daemon:
                 self.log.warning("%s start failed: %s", channel.name, exc)
         self.log.info("polling %s", channel.name)
         backoff = 1
+        state = self._store()
         while not self.stop_event.is_set():
             try:
                 messages = channel.poll(POLL_TIMEOUT)
+                self._note(state, f"{channel.name}.last_poll", datetime.now(timezone.utc).replace(microsecond=0).isoformat())
             except ConflictError as exc:
+                self._note(state, f"{channel.name}.last_error", f"{exc} (another whoami/daemon was polling)")
                 self.log.error("%s: %s; stopping", channel.name, exc)
                 self.exit_code = 1
                 self.stop_event.set()
                 return
             except ChannelError as exc:
+                self._note(state, f"{channel.name}.last_error", str(exc))
                 self.log.warning("%s poll failed: %s; retrying in %ds", channel.name, exc, backoff)
                 self.stop_event.wait(backoff)
                 backoff = min(MAX_BACKOFF, backoff * 2)
@@ -308,6 +329,13 @@ class Daemon:
             backoff = 1
             for msg in messages:
                 self.queue.put(msg)
+
+    @staticmethod
+    def _note(store: Store, key: str, value: str) -> None:
+        try:
+            store.set_state(key, value)
+        except Exception:  # noqa: BLE001 - diagnostics only
+            pass
 
     def _worker_loop(self) -> None:
         while not self.stop_event.is_set():

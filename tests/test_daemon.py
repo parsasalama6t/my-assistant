@@ -331,3 +331,13 @@ def test_run_once_fires_a_critical_row_as_text_and_call(store: Store, tg_config:
     assert channel.sent == [("111", "Gate closes in 10")]
     assert voice.calls == [("+14165550100", "Gate closes in 10")]
     assert [s["via"] for s in report.sent] == ["text", "call"]
+
+
+def test_daemon_records_last_inbound(store: Store, tg_config: Config) -> None:
+    import json
+
+    daemon, channel, client = make_daemon(store, tg_config, [])
+    daemon.handle_inbound(InboundMessage(channel="telegram", chat_id="999", text="hello", message_id="m1", sender="Sam"))
+    seen = json.loads(store.get_state("telegram.last_inbound"))
+    assert seen["chat_id"] == "999" and seen["allowed"] is False and seen["text"] == "hello"
+    assert channel.sent == [] and client.calls == []

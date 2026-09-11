@@ -286,22 +286,41 @@ _NO_CHANNELS_MESSAGE = (
 )
 
 
-def _configure_logging() -> None:
+def _log_path(config: Config) -> Path:
+    return config.data_dir / "daemon.log"
+
+
+def _configure_logging(config: Config | None = None) -> None:
     level_name = os.environ.get("ASSISTANT_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    if config is not None:
+        try:
+            config.data_dir.mkdir(parents=True, exist_ok=True)
+            handlers.append(logging.FileHandler(_log_path(config), encoding="utf-8"))
+        except OSError:
+            pass
+    logging.basicConfig(level=level, format=fmt, handlers=handlers, force=True)
     logging.getLogger("httpx2").setLevel(max(level, logging.WARNING))
+
+
+def _last_inbound(store: Store, channel: str = "telegram") -> dict[str, Any] | None:
+    raw = store.get_state(f"{channel}.last_inbound")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def cmd_daemon(args: argparse.Namespace, store: Store, config: Config) -> int:
     from assistant.channels import ChannelError
     from assistant.daemon import Daemon
 
-    _configure_logging()
+    _configure_logging(config)
     daemon = Daemon(config, google=load_google(config))
     if not daemon.channels:
         print(_NO_CHANNELS_MESSAGE, file=sys.stderr)
@@ -452,6 +471,19 @@ def cmd_channels(args: argparse.Namespace, store: Store, config: Config) -> int:
             print("TELEGRAM_BOT_TOKEN is not set; whoami only works for Telegram.", file=sys.stderr)
             return 2
         from assistant.channels.telegram import TelegramChannel
+
+        running = _daemon_pid(config)
+        if running:
+            print(f"The daemon is running (pid {running}); it and whoami cannot both listen to Telegram.")
+            last = _last_inbound(store)
+            if last:
+                print(f"The daemon last saw a message from chat id {last['chat_id']} "
+                      f"({last.get('sender') or '?'}: {last.get('text', '')!r}).")
+                print(f"Put TELEGRAM_CHAT_ID={last['chat_id']} in .env and restart the daemon.")
+            else:
+                print("Send your bot a message, then run `my-assistant doctor` to see the chat id it saw,")
+                print("or stop the daemon (Ctrl-C in its window) and run whoami again.")
+            return 0 if last else 1
 
         seconds = args.seconds
         print(f"Send /start (or any message) to your bot now; listening for {seconds} seconds...")
@@ -870,9 +902,37 @@ def cmd_doctor(args: argparse.Namespace, store: Store, config: Config) -> int:
     pid = _daemon_pid(config)
     if pid:
         line(ok_mark, f"daemon is running (pid {pid})")
+        last_poll = store.get_state("telegram.last_poll")
+        last_error = store.get_state("telegram.last_error")
+        if last_poll:
+            line(ok_mark, f"daemon last heard from Telegram at {last_poll} (UTC)")
+        elif config.telegram_bot_token:
+            line(warn_mark, "daemon has not completed a Telegram poll yet"
+                 + (f"; last error: {last_error}" if last_error else ""),
+                 "look at the daemon's window or the log below; restart it with `my-assistant daemon`")
+        last = _last_inbound(store)
+        if last:
+            who = f"chat id {last['chat_id']} ({last.get('sender') or '?'}: {last.get('text', '')!r}) at {last.get('at')}"
+            if last["chat_id"] in config.telegram_chat_ids:
+                line(ok_mark, f"last message seen from {who}, allowlisted")
+            else:
+                line(bad_mark, f"last message seen from {who}, which is NOT in TELEGRAM_CHAT_ID",
+                     f"set TELEGRAM_CHAT_ID={last['chat_id']} in .env, then restart the daemon (Ctrl-C, `my-assistant daemon`)")
+        elif config.telegram_bot_token and last_poll:
+            line(warn_mark, "daemon has not seen any message yet; send your bot a message and run doctor again")
     else:
         line(bad_mark, "daemon is not running; the bot only answers while it runs",
              "run `my-assistant daemon` in a terminal and leave it open")
+    log_path = _log_path(config)
+    if log_path.is_file():
+        try:
+            tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-6:]
+        except OSError:
+            tail = []
+        if tail:
+            print(f"      last lines of {log_path}:")
+            for entry in tail:
+                print(f"        {entry[:160]}")
 
     google_ok = load_google(config, quiet=True) is not None
     line(ok_mark if google_ok else warn_mark,

@@ -52,3 +52,20 @@ def test_doctor_rejects_non_numeric_chat_id(monkeypatch, tmp_path, capsys) -> No
     code, out = _run(monkeypatch, tmp_path, env, capsys, token_result=(True, "mybot"))
     assert code == 1
     assert "TELEGRAM_CHAT_ID must be a number" in out and "not the bot's name" in out
+
+
+def test_doctor_suggests_chat_id_seen_by_daemon(monkeypatch, tmp_path, capsys) -> None:
+    import json
+    from assistant.store import Store
+
+    env = "ANTHROPIC_API_KEY=sk-ant-abc\nTELEGRAM_BOT_TOKEN=1:x\nTELEGRAM_CHAT_ID=1\n"
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "daemon.pid").write_text(str(os.getpid()))
+    s = Store(data / "assistant.db")
+    s.set_state("telegram.last_poll", "2026-09-11T15:00:00+00:00")
+    s.set_state("telegram.last_inbound", json.dumps({"chat_id": "777", "sender": "Parsa", "text": "hi", "allowed": False, "at": "x"}))
+    s.close()
+    code, out = _run(monkeypatch, tmp_path, env, capsys, token_result=(True, "mybot"))
+    assert code == 1
+    assert "set TELEGRAM_CHAT_ID=777" in out
