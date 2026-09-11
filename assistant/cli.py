@@ -315,11 +315,50 @@ def cmd_daemon(args: argparse.Namespace, store: Store, config: Config) -> int:
         for item in report.failed:
             print(f"  failed #{item['id']} ({item['kind']}): {item.get('error')}")
         return 0
+    pid_file = _pid_path(config)
+    try:
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+    _print_live_banner(config)
     try:
         return daemon.run()
     except ChannelError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    finally:
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+
+
+def _pid_path(config: Config) -> Path:
+    return config.data_dir / "daemon.pid"
+
+
+def _daemon_pid(config: Config) -> int | None:
+    """Pid of a running daemon, or None."""
+    try:
+        pid = int(_pid_path(config).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def _print_live_banner(config: Config) -> None:
+    if config.telegram_bot_token:
+        ok, info = _validate_telegram_token(config.telegram_bot_token)
+        if ok:
+            print(f"Live on Telegram as @{info}. Open t.me/{info} and send it a message.", flush=True)
+        elif ok is False:
+            print(f"Telegram rejected the bot token: {info}", flush=True)
+    print("Press Ctrl-C to stop. While this is running, scheduled texts go out and messages get answered.", flush=True)
 
 
 def _channel_summary(config: Config) -> list[str]:
@@ -773,6 +812,78 @@ def cmd_setup(args: argparse.Namespace, store: Store, config: Config) -> int:
     return 0
 
 
+_PLACEHOLDER_KEYS = {"", "sk-ant-...", "FILL IN", "your-api-key"}
+
+
+def cmd_doctor(args: argparse.Namespace, store: Store, config: Config) -> int:
+    """Check every step needed for the bot to answer, and say what to fix."""
+    ok_mark, bad_mark, warn_mark = "OK ", "FIX", "?? "
+    problems: list[str] = []
+
+    def line(status: str, text: str, fix: str | None = None) -> None:
+        print(f"[{status}] {text}")
+        if fix:
+            print(f"      -> {fix}")
+            problems.append(fix)
+
+    env_path = Path.cwd() / ".env"
+    if env_path.is_file():
+        line(ok_mark, f".env found at {env_path}")
+    else:
+        line(bad_mark, f"no .env in {Path.cwd()}",
+             "run `my-assistant setup` here, or `cd` into the my-assistant folder first")
+
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key in _PLACEHOLDER_KEYS or key.endswith("..."):
+        line(bad_mark, "ANTHROPIC_API_KEY is missing or still the placeholder",
+             "paste a real key from https://console.anthropic.com/ into .env (it starts with sk-ant-)")
+    elif not key.startswith("sk-ant-"):
+        line(warn_mark, "ANTHROPIC_API_KEY does not look like an Anthropic key (expected sk-ant-...)")
+    else:
+        line(ok_mark, "ANTHROPIC_API_KEY is set")
+
+    if not config.telegram_bot_token:
+        line(bad_mark, "TELEGRAM_BOT_TOKEN is not set",
+             "add TELEGRAM_BOT_TOKEN=<token from @BotFather> to .env")
+    else:
+        valid, info = _validate_telegram_token(config.telegram_bot_token)
+        if valid:
+            line(ok_mark, f"Telegram token works: bot is @{info}")
+        elif valid is False:
+            line(bad_mark, f"Telegram rejected the token: {info}",
+                 "copy the token again from @BotFather (`/mybots` -> your bot -> API Token)")
+        else:
+            line(warn_mark, f"could not verify the Telegram token: {info}")
+
+    if config.telegram_chat_ids:
+        line(ok_mark, f"TELEGRAM_CHAT_ID is set ({', '.join(config.telegram_chat_ids)})")
+    elif config.telegram_bot_token:
+        line(bad_mark, "TELEGRAM_CHAT_ID is not set, so the bot would ignore everyone",
+             "run `my-assistant channels whoami`, press Start on the bot in Telegram, "
+             "put the printed id in .env as TELEGRAM_CHAT_ID")
+
+    pid = _daemon_pid(config)
+    if pid:
+        line(ok_mark, f"daemon is running (pid {pid})")
+    else:
+        line(bad_mark, "daemon is not running; the bot only answers while it runs",
+             "run `my-assistant daemon` in a terminal and leave it open")
+
+    google_ok = load_google(config, quiet=True) is not None
+    line(ok_mark if google_ok else warn_mark,
+         "Google Calendar/Gmail: " + ("connected" if google_ok else "not connected (optional)"))
+    line(ok_mark if config.has_voice() else warn_mark,
+         "Phone calls: " + ("on" if config.has_voice() else "off (optional, needs Twilio)"))
+
+    print()
+    if problems:
+        print(f"{len(problems)} thing(s) to fix. Start with the first one:")
+        print(f"  {problems[0]}")
+        return 1
+    print("Everything needed is in place. Message your bot.")
+    return 0
+
+
 # ------------------------------------------------------------------ parser
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="my-assistant", description="Your personal assistant.")
@@ -855,6 +966,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("demo", help="scripted end-to-end demo, no credentials needed")
     p.set_defaults(func=cmd_demo)
+
+    p = sub.add_parser("doctor", help="check every setup step and say what to fix")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("setup", help="interactive setup wizard that writes .env")
     p.add_argument("--env", default=".env", help="path of the .env file to write")

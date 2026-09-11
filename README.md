@@ -56,8 +56,13 @@ my-assistant channels test           # you get a test message on your phone
 my-assistant daemon                  # start the always-on assistant
 ```
 
-Message your bot. Leave the daemon running (see [deploy/README.md](deploy/README.md)
-for running it 24/7).
+Message your bot. **The bot only answers while `my-assistant daemon` is running**; a
+bot created in BotFather is just a name until this program is listening for it. Leave the
+daemon running (see [deploy/README.md](deploy/README.md) for running it 24/7).
+
+If nothing happens when you message the bot, run `my-assistant doctor`. It checks each
+step (the `.env` file, the API key, the bot token, your chat id, whether the daemon is
+running) and tells you exactly what to fix.
 
 On macOS the command is `python3`, not `python`. If `python3` is not found, install it
 with `brew install python` or from [python.org](https://www.python.org/downloads/).
@@ -74,6 +79,7 @@ my-assistant briefing [--send]   # print today's briefing, or text it to you
 my-assistant serve               # web UI at http://127.0.0.1:8000
 my-assistant demo                # scripted end-to-end demo, no credentials
 
+my-assistant doctor              # check every setup step and say what to fix
 my-assistant daemon [--once]     # always-on: answers messages and sends scheduled texts
 my-assistant channels status     # what's configured, default target, timezone
 my-assistant channels test       # send yourself a test message (--call to test a phone call)
