@@ -45,3 +45,10 @@ def test_doctor_reports_missing_chat_id(monkeypatch, tmp_path, capsys) -> None:
     code, out = _run(monkeypatch, tmp_path, env, capsys, token_result=(True, "mybot"))
     assert code == 1
     assert "TELEGRAM_CHAT_ID is not set" in out and "channels whoami" in out
+
+
+def test_doctor_rejects_non_numeric_chat_id(monkeypatch, tmp_path, capsys) -> None:
+    env = "ANTHROPIC_API_KEY=sk-ant-abc\nTELEGRAM_BOT_TOKEN=1:x\nTELEGRAM_CHAT_ID=angiebutbot\n"
+    code, out = _run(monkeypatch, tmp_path, env, capsys, token_result=(True, "mybot"))
+    assert code == 1
+    assert "TELEGRAM_CHAT_ID must be a number" in out and "not the bot's name" in out

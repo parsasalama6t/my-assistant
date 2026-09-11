@@ -855,7 +855,12 @@ def cmd_doctor(args: argparse.Namespace, store: Store, config: Config) -> int:
         else:
             line(warn_mark, f"could not verify the Telegram token: {info}")
 
-    if config.telegram_chat_ids:
+    bad_ids = [c for c in config.telegram_chat_ids if not c.lstrip("-").isdigit()]
+    if bad_ids:
+        line(bad_mark, f"TELEGRAM_CHAT_ID must be a number, not {', '.join(bad_ids)!r}",
+             "it is YOUR Telegram id, not the bot's name: send /id to the bot while the daemon "
+             "runs, or run `my-assistant channels whoami`, and put the number in .env")
+    elif config.telegram_chat_ids:
         line(ok_mark, f"TELEGRAM_CHAT_ID is set ({', '.join(config.telegram_chat_ids)})")
     elif config.telegram_bot_token:
         line(bad_mark, "TELEGRAM_CHAT_ID is not set, so the bot would ignore everyone",
