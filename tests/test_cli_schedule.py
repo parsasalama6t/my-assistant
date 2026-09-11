@@ -145,3 +145,22 @@ def test_write_env_merges_without_clobbering(tmp_path: Path) -> None:
 
     cli.write_env(path, {"ANTHROPIC_API_KEY": "new"}, confirm=lambda key: True)
     assert "ANTHROPIC_API_KEY=new" in path.read_text(encoding="utf-8")
+
+
+def test_daemon_refuses_when_another_is_running(monkeypatch, tmp_path, capsys) -> None:
+    import os
+
+    from assistant import cli
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("TELEGRAM_BOT_TOKEN=1:x\nTELEGRAM_CHAT_ID=1\n")
+    for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        monkeypatch.delenv(key, raising=False)
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setenv("ASSISTANT_DATA_DIR", str(data))
+    (data / "daemon.pid").write_text(str(os.getppid()))  # alive, and not this process
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["daemon"])
+    assert exc.value.code == 1
+    assert "Another daemon is already running" in capsys.readouterr().err

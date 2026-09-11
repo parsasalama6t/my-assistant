@@ -320,6 +320,14 @@ def cmd_daemon(args: argparse.Namespace, store: Store, config: Config) -> int:
     from assistant.channels import ChannelError
     from assistant.daemon import Daemon
 
+    running = _daemon_pid(config)
+    if running and running != os.getpid() and not args.once:
+        print(
+            f"Another daemon is already running (pid {running}). Only one can listen to Telegram.\n"
+            f"Stop it first: press Ctrl-C in its window, or run:  kill {running}",
+            file=sys.stderr,
+        )
+        return 1
     _configure_logging(config)
     daemon = Daemon(config, google=load_google(config))
     if not daemon.channels:
