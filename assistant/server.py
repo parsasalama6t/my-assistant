@@ -7,8 +7,9 @@ import queue
 import threading
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import parse_qsl
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -29,8 +30,14 @@ def _sse(event: str, data: Any) -> str:
 
 
 def create_app(
-    store: Store, config: Config, client: Any | None = None, google: Any | None = None
+    store: Store,
+    config: Config,
+    client: Any | None = None,
+    google: Any | None = None,
+    daemon: Any | None = None,
 ) -> FastAPI:
+    """Build the app. With `daemon` (a `Daemon` or anything with `handle_inbound`),
+    Twilio webhook posts are answered through it."""
     app = FastAPI(title="my-assistant")
     lock = threading.Lock()  # one turn at a time; the store is a single SQLite connection
 
@@ -86,6 +93,52 @@ def create_app(
     @app.get("/api/memories")
     def memories() -> list[dict[str, Any]]:
         return store.list_memories()
+
+    @app.get("/api/schedules")
+    def schedules(all: bool = False) -> list[dict[str, Any]]:
+        return store.list_schedules(enabled_only=not all, include_system=all)
+
+    if config.twilio_account_sid and config.twilio_auth_token:
+        from assistant.channels.twilio import TwilioChannel
+
+        twilio = TwilioChannel(
+            config.twilio_account_sid,
+            config.twilio_auth_token,
+            config.twilio_from,
+            config.twilio_whatsapp_from,
+            set(config.allowed_chat_ids("twilio")),
+            config.twilio_webhook_url,
+            store,
+        )
+
+        def _handle_inbound(msg: Any) -> None:
+            if daemon is not None:
+                daemon.handle_inbound(msg)
+                return
+            with lock:
+                session_id = store.session_for_chat(msg.channel, msg.chat_id, config.session_idle_hours * 3600)
+                assistant = Assistant(
+                    store, config, client=client, session_id=session_id, google=google,
+                    channel=msg.channel, chat_id=msg.chat_id,
+                )
+                try:
+                    result = assistant.chat(msg.text)
+                    reply = result.text or result.refusal or ""
+                except AssistantError as exc:
+                    reply = f"Sorry, something went wrong: {exc}"
+            if reply:
+                twilio.send(msg.chat_id, reply)
+
+        @app.post("/webhooks/twilio")
+        async def twilio_webhook(request: Request) -> Response:
+            body = (await request.body()).decode("utf-8", errors="replace")
+            form = dict(parse_qsl(body, keep_blank_values=True))
+            public_url = config.twilio_webhook_url or str(request.url)
+            status, text, message = twilio.handle_webhook(public_url, dict(request.headers), form)
+            if message is not None:
+                threading.Thread(target=_handle_inbound, args=(message,), daemon=True).start()
+            media_type = "text/xml" if text.lstrip().startswith("<") else "text/plain"
+            return Response(content=text, status_code=status, media_type=media_type)
 
     @app.post("/api/chat")
     def chat(req: ChatRequest) -> StreamingResponse:
