@@ -856,7 +856,8 @@ def cmd_doctor(args: argparse.Namespace, store: Store, config: Config) -> int:
         print(f"[{status}] {text}")
         if fix:
             print(f"      -> {fix}")
-            problems.append(fix)
+            if status == bad_mark:
+                problems.append(fix)
 
     env_path = Path.cwd() / ".env"
     if env_path.is_file():
