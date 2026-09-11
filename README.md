@@ -17,6 +17,9 @@ see the real scheduler and message routing with scripted replies.
   task's due time. These never call the model.
 - **Say it once.** "Text me at 3 to call mom." "Every weekday 6am remind me to
   stretch." "Move standup to Monday." The assistant schedules, edits, and cancels.
+- **It calls you when it matters.** Every reminder has a priority: *normal* texts;
+  *important* texts, then phones you if you haven't replied in 10 minutes; *critical*
+  calls right away. "Call me at 5:45 to wake me for the flight" just works.
 - **Gmail and Google Calendar.** Search and read mail, draft replies, send only when
   you say so; create, move, and delete events with attendees.
 - **Memory.** Remembers people, preferences, and routines across conversations.
@@ -73,11 +76,11 @@ my-assistant demo                # scripted end-to-end demo, no credentials
 
 my-assistant daemon [--once]     # always-on: answers messages and sends scheduled texts
 my-assistant channels status     # what's configured, default target, timezone
-my-assistant channels test       # send yourself a test message
+my-assistant channels test       # send yourself a test message (--call to test a phone call)
 my-assistant channels whoami     # discover your Telegram chat id
 
 my-assistant schedule list [--all]
-my-assistant schedule add "Call mom" --at 2026-09-12T15:00 [--repeat weekdays]
+my-assistant schedule add "Call mom" --at 2026-09-12T15:00 [--repeat weekdays] [--priority important]
 my-assistant schedule cancel ID
 my-assistant schedule sync       # rebuild task/event reminders now
 my-assistant schedule deliveries # what was sent, skipped, or failed
@@ -102,6 +105,18 @@ show quick lists, `/id` shows your chat id, `/help` lists commands.
 The token is stored at `~/.my-assistant/google_token.json` (owner-only) and refreshes
 itself. Scopes: calendar events (read/write) and Gmail modify (read, draft, send, mark
 read). The assistant drafts email by default and sends only when you explicitly ask.
+
+## Phone calls (optional, needs Twilio)
+
+Telegram cannot place calls, so voice goes through [Twilio](https://www.twilio.com/)
+whichever chat channel you use. You need `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, a
+Twilio phone number in `TWILIO_VOICE_FROM` (or `TWILIO_FROM`), and your own number in
+`USER_PHONE`. A free trial account can call your own verified number (with a short trial
+notice at the start); upgrading removes it. Test with `my-assistant channels test --call`.
+
+The call reads the message aloud twice and hangs up. Replying to the text that preceded an
+*important* reminder cancels the pending call. Set the wait with
+`ASSISTANT_ESCALATE_MINUTES` (default 10).
 
 ## WhatsApp or SMS instead of Telegram (optional)
 
@@ -137,6 +152,7 @@ reminders, with prompt caching on:
 | Telegram | free | $0 | $0 | $0 |
 | WhatsApp via Twilio | $0.005 Twilio fee per message each way + Meta $0.004 per scheduled template | ~$0.19 | ~$1.30 | ~$5.70 |
 | SMS (Canada) via Twilio | $0.0079 per 160-char segment each way + ~$1.15/month number | ~$0.55 | ~$3.80 | ~$17.50 |
+| Phone calls via Twilio | ~$0.015 per minute (a reminder call rounds to 1 minute) + ~$1.15/month number | | | ~$1.25 for 10 calls |
 | Cloud server | | | | ~$5 |
 | Your Mac | | | | $0 |
 
@@ -162,6 +178,7 @@ loaded automatically. `my-assistant setup` writes it. See `.env.example` for the
 | `ASSISTANT_CATCHUP_GRACE_MINUTES` | `120` | Missed recurring reminders older than this are skipped, not sent late. |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | – | Telegram bot and the only chat it answers. |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`, `TWILIO_WHATSAPP_FROM`, `TWILIO_WEBHOOK_URL`, `USER_PHONE` | – | WhatsApp/SMS. |
+| `TWILIO_VOICE_FROM`, `ASSISTANT_ESCALATE_MINUTES` | `TWILIO_FROM`, `10` | Phone calls and the text-to-call wait. |
 | `ASSISTANT_DATA_DIR` | `~/.my-assistant` | Database and tokens. |
 | `ASSISTANT_WEB_SEARCH` | off | `1` lets the assistant search the web. |
 | `ASSISTANT_FALLBACKS` | on | Server-side refusal fallbacks; `0` disables. |
@@ -176,7 +193,8 @@ loaded automatically. `my-assistant setup` writes it. See `.env.example` for the
   derived from tasks, local events, and Google Calendar.
 - `assistant/daemon.py` – threads for channel polling, the scheduler, and a single worker
   that routes incoming messages to the agent.
-- `assistant/channels/` – Telegram (long polling) and Twilio (REST + signed webhook).
+- `assistant/channels/` – Telegram (long polling) and Twilio (REST + signed webhook);
+  `assistant/voice.py` – outbound calls that read a message aloud.
 - `assistant/tools.py` – tasks, notes, events, memory, time, scheduling, and the Google
   tools (offered to the model only when connected).
 - `assistant/google_client.py` – OAuth and a small facade over Calendar and Gmail.
