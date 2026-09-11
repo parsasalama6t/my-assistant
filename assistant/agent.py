@@ -10,7 +10,7 @@ import anthropic
 from assistant.config import Config
 from assistant.prompts import build_system
 from assistant.store import Store
-from assistant.tools import run_tool, tool_definitions
+from assistant.tools import ToolContext, run_tool, tool_definitions
 
 TextCallback = Callable[[str], None]
 ToolCallback = Callable[[str, dict[str, Any], str, bool], None]
@@ -54,10 +54,13 @@ class Assistant:
         config: Config,
         client: Any | None = None,
         session_id: str | None = None,
+        google: Any | None = None,
     ) -> None:
         self.store = store
         self.config = config
         self.client = client or anthropic.Anthropic()
+        self.google = google
+        self.tools = ToolContext(store=store, google=google)
         self.session_id = session_id or store.latest_session() or store.create_session()
 
     # ------------------------------------------------------------ sessions
@@ -76,8 +79,14 @@ class Assistant:
         kwargs: dict[str, Any] = dict(
             model=self.config.model,
             max_tokens=self.config.max_tokens,
-            system=build_system(self.config.user_name, self.store.list_memories()),
-            tools=tool_definitions(web_search=self.config.web_search),
+            system=build_system(
+                self.config.user_name,
+                self.store.list_memories(),
+                google_email=getattr(self.google, "email", None) if self.google else None,
+            ),
+            tools=tool_definitions(
+                web_search=self.config.web_search, google=self.google is not None
+            ),
             thinking={"type": "adaptive"},
             output_config={"effort": self.config.effort},
             messages=messages,
@@ -170,7 +179,7 @@ class Assistant:
             for block in response.content:
                 if block.type != "tool_use":
                     continue
-                output, is_error = run_tool(self.store, block.name, dict(block.input or {}))
+                output, is_error = run_tool(self.tools, block.name, dict(block.input or {}))
                 result.tool_calls.append(
                     {"name": block.name, "input": block.input, "output": output, "error": is_error}
                 )

@@ -8,7 +8,9 @@ What it can do:
 
 - **Tasks** – add, list, update, complete, and delete to-dos with due dates and priorities.
 - **Notes** – save and search notes with tags.
-- **Calendar** – add and list events and appointments.
+- **Google Calendar** – reads your real calendar, creates and deletes events, invites attendees.
+- **Gmail** – searches and reads your inbox, drafts replies, and sends email when you ask it to.
+- **Local calendar** – a fallback event list when Google isn't connected.
 - **Memory** – remembers facts you tell it (preferences, people, routines) across conversations.
 - **Briefing** – a daily rundown of what is due and what is coming up.
 - **Web search** (optional) – look things up when you turn it on.
@@ -22,7 +24,7 @@ Requires Python 3.10+ and an Anthropic API key.
 git clone https://github.com/parsasalama6t/my-assistant
 cd my-assistant
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[web,dev]"      # or just `pip install -e .` for the CLI only
+pip install -e ".[web,google,dev]"   # or just `pip install -e .` for the CLI only
 cp .env.example .env             # then put your ANTHROPIC_API_KEY in .env
 ```
 
@@ -66,6 +68,42 @@ assistant> Tomorrow (Friday, Sept 11):
 - Renew passport is still open, due Sept 30
 ```
 
+## Connect Google Calendar and Gmail
+
+The assistant talks to Google with your own OAuth client, so nothing goes through a third party.
+
+1. In [Google Cloud Console](https://console.cloud.google.com/) create a project (or pick one) and
+   enable the **Google Calendar API** and the **Gmail API**.
+2. Under *APIs & Services → OAuth consent screen*, set up an External app and add your own Google
+   account as a test user.
+3. Under *Credentials*, create an **OAuth client ID** of type **Desktop app** and download the JSON.
+4. Save it as `~/.my-assistant/google_credentials.json` (or point `ASSISTANT_GOOGLE_CREDENTIALS` at it).
+5. Run the login once; a browser window opens for consent:
+
+```bash
+pip install -e ".[google]"
+my-assistant google login
+my-assistant google status     # shows the connected account
+```
+
+The token is stored at `~/.my-assistant/google_token.json` with owner-only permissions and refreshed
+automatically. `my-assistant google logout` removes it. Scopes requested: calendar events
+(read/write) and Gmail modify (read, draft, send, mark read). The assistant drafts email by default
+and only sends when you explicitly ask.
+
+Once connected, the assistant uses your Google Calendar for scheduling questions and your inbox for
+email, and the briefing includes unread mail that looks like it needs action:
+
+```
+you> anything from Dana this week?
+assistant> One unread email from Dana (Tue): "Kitchen quote" – she's asking whether Friday works
+for the site visit. Want me to draft a reply?
+
+you> yes, say Friday at 10 works and put it on my calendar
+assistant> Drafted the reply to Dana and added "Site visit – Dana" Friday 10:00–11:00 to your
+calendar. Say "send it" when you want the draft to go out.
+```
+
 ## Configuration
 
 Everything is read from environment variables (a `.env` file in the working
@@ -81,13 +119,18 @@ directory is loaded automatically). See `.env.example`.
 | `ASSISTANT_WEB_SEARCH` | off | Set to `1` to enable web search. |
 | `ASSISTANT_FALLBACKS` | on | Server-side refusal fallbacks: if the model declines a request for safety reasons, the API retries it on a fallback model in the same call. Set to `0` to disable. |
 | `ASSISTANT_MAX_TOKENS` | `16000` | Max output tokens per response. |
+| `ASSISTANT_GOOGLE` | on | Set to `0` to ignore a stored Google login. |
+| `ASSISTANT_GOOGLE_CREDENTIALS` | `~/.my-assistant/google_credentials.json` | Path to the OAuth client JSON. |
 
 ## How it works
 
 - `assistant/agent.py` – the loop: send the conversation, stream the reply, run any
   tools Claude asks for, feed results back, repeat until Claude is done. Uses adaptive
   thinking and prompt caching on the stable part of the system prompt.
-- `assistant/tools.py` – tool definitions and handlers (tasks, notes, events, memory, time).
+- `assistant/tools.py` – tool definitions and handlers (tasks, notes, events, memory, time,
+  and the Google Calendar/Gmail tools, which are only offered to the model when Google is connected).
+- `assistant/google_client.py` – OAuth login/token handling and a small facade over the Calendar
+  and Gmail APIs.
 - `assistant/store.py` – SQLite storage, including full conversation history so
   sessions resume across runs.
 - `assistant/prompts.py` – the system prompt; memories are injected every turn.
@@ -96,8 +139,9 @@ directory is loaded automatically). See `.env.example`.
 ## Development
 
 ```bash
-pip install -e ".[web,dev]"
+pip install -e ".[web,google,dev]"
 pytest
 ```
 
-Tests use a scripted fake client, so they run without an API key.
+Tests use a scripted fake Claude client and a fake Google client, so they run without any
+credentials.

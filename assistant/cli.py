@@ -9,6 +9,7 @@ from typing import Any
 from assistant import __version__
 from assistant.agent import Assistant, AssistantError
 from assistant.config import Config
+from assistant.google_client import GoogleClient, GoogleNotConnected
 from assistant.store import Store
 
 BOLD = "\033[1m"
@@ -20,8 +21,10 @@ RESET = "\033[0m"
 
 BRIEFING_PROMPT = (
     "Give me my briefing for today. Check the current date, then list today's and "
-    "tomorrow's events, overdue and due-soon tasks, and anything else from what you "
-    "remember about me that's relevant today. Be concise; if a section is empty, skip it."
+    "tomorrow's events, overdue and due-soon tasks, and, if Gmail is connected, unread "
+    "emails from the last two days that look like they need a reply or action. Add "
+    "anything from what you remember about me that's relevant today. Be concise; if a "
+    "section is empty, skip it."
 )
 
 HELP_TEXT = f"""{BOLD}Commands{RESET}
@@ -33,6 +36,18 @@ HELP_TEXT = f"""{BOLD}Commands{RESET}
   /help       show this help
   /quit       exit (or Ctrl-D)
 Anything else is sent to your assistant."""
+
+
+def load_google(config: Config, quiet: bool = False) -> GoogleClient | None:
+    """Return a connected Google client, or None when not set up / disabled."""
+    if not config.google or not GoogleClient.is_connected(config.data_dir):
+        return None
+    try:
+        return GoogleClient.load(config.data_dir)
+    except (GoogleNotConnected, RuntimeError, OSError, ValueError) as exc:
+        if not quiet:
+            print(f"Google integration unavailable: {exc}", file=sys.stderr)
+        return None
 
 
 def _color(enabled: bool):
@@ -75,10 +90,12 @@ def _print_list(title: str, rows: list[dict[str, Any]], fmt) -> None:
 # ----------------------------------------------------------------- commands
 def cmd_chat(args: argparse.Namespace, store: Store, config: Config) -> int:
     color = _color(sys.stdout.isatty())
-    assistant = Assistant(store, config)
+    google = load_google(config)
+    assistant = Assistant(store, config, google=google)
     if args.new or not assistant.history():
         assistant.new_session()
-    print(color(f"my-assistant {__version__} · {config.model} · effort {config.effort}", DIM))
+    status = f"google {google.email or 'connected'}" if google else "google off"
+    print(color(f"my-assistant {__version__} · {config.model} · effort {config.effort} · {status}", DIM))
     print(color("Type /help for commands, /quit to exit.", DIM))
 
     def on_tool(name: str, tool_input: dict[str, Any], output: str, is_error: bool) -> None:
@@ -133,7 +150,7 @@ def cmd_chat(args: argparse.Namespace, store: Store, config: Config) -> int:
 
 
 def cmd_ask(args: argparse.Namespace, store: Store, config: Config) -> int:
-    assistant = Assistant(store, config)
+    assistant = Assistant(store, config, google=load_google(config))
     if args.new:
         assistant.new_session()
     try:
@@ -146,7 +163,7 @@ def cmd_ask(args: argparse.Namespace, store: Store, config: Config) -> int:
 
 
 def cmd_briefing(args: argparse.Namespace, store: Store, config: Config) -> int:
-    assistant = Assistant(store, config)
+    assistant = Assistant(store, config, google=load_google(config))
     assistant.new_session("briefing")
     try:
         assistant.chat(BRIEFING_PROMPT, on_text=lambda c: print(c, end="", flush=True))
@@ -197,10 +214,47 @@ def cmd_serve(args: argparse.Namespace, store: Store, config: Config) -> int:
     except ImportError:
         print("The web UI needs extra packages: pip install 'my-assistant[web]'", file=sys.stderr)
         return 1
-    app = create_app(store, config)
+    app = create_app(store, config, google=load_google(config))
     print(f"Web UI at http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
+
+
+def cmd_google(args: argparse.Namespace, store: Store, config: Config) -> int:
+    creds = config.google_credentials_path
+    token = GoogleClient.token_path(config.data_dir)
+    if args.action == "login":
+        try:
+            client = GoogleClient.login(config.data_dir, creds)
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            print(
+                "\nSetup: in Google Cloud Console enable the Google Calendar API and Gmail API, "
+                "create an OAuth client of type 'Desktop app', download its JSON, and save it as\n"
+                f"  {creds}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Connected Google account {client.email or ''}".rstrip() + ".")
+        return 0
+    if args.action == "status":
+        if not token.is_file():
+            print("Google: not connected. Run: my-assistant google login")
+            return 0
+        client = load_google(config)
+        if client is None:
+            return 1
+        print(f"Google: connected as {client.email or '(unknown account)'}")
+        print(f"Token: {token}")
+        return 0
+    if args.action == "logout":
+        if token.is_file():
+            token.unlink()
+            print("Disconnected Google (token removed).")
+        else:
+            print("Google was not connected.")
+        return 0
+    return 1
 
 
 # ------------------------------------------------------------------ parser
@@ -237,6 +291,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("sessions", help="list past conversations")
     p.set_defaults(func=cmd_sessions)
+
+    p = sub.add_parser("google", help="connect Google Calendar and Gmail")
+    p.add_argument("action", choices=["login", "status", "logout"])
+    p.set_defaults(func=cmd_google)
 
     p = sub.add_parser("serve", help="run the web UI")
     p.add_argument("--host", default="127.0.0.1")

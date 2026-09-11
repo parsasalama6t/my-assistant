@@ -28,7 +28,9 @@ def _sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def create_app(store: Store, config: Config, client: Any | None = None) -> FastAPI:
+def create_app(
+    store: Store, config: Config, client: Any | None = None, google: Any | None = None
+) -> FastAPI:
     app = FastAPI(title="my-assistant")
     lock = threading.Lock()  # one turn at a time; the store is a single SQLite connection
 
@@ -42,6 +44,7 @@ def create_app(store: Store, config: Config, client: Any | None = None) -> FastA
             "model": config.model,
             "effort": config.effort,
             "user_name": config.user_name,
+            "google": getattr(google, "email", "") or "" if google else None,
             "session_id": store.latest_session() or store.create_session(),
         }
 
@@ -93,7 +96,9 @@ def create_app(store: Store, config: Config, client: Any | None = None) -> FastA
 
         def worker() -> None:
             with lock:
-                assistant = Assistant(store, config, client=client, session_id=req.session_id)
+                assistant = Assistant(
+                    store, config, client=client, session_id=req.session_id, google=google
+                )
                 try:
                     result = assistant.chat(
                         req.message,

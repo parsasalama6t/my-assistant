@@ -11,9 +11,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
+from assistant.google_client import GoogleClient, GoogleNotConnected
 from assistant.store import Store
 
-Handler = Callable[[Store, dict[str, Any]], Any]
+
+@dataclass
+class ToolContext:
+    """Everything a tool handler may need."""
+
+    store: Store
+    google: GoogleClient | None = None
+
+
+Handler = Callable[["ToolContext", dict[str, Any]], Any]
 
 
 @dataclass(frozen=True)
@@ -46,7 +56,7 @@ DATETIME_HINT = "ISO 8601 (e.g. 2026-09-14 or 2026-09-14T15:30)."
 
 
 # ----------------------------------------------------------------- handlers
-def _now(store: Store, args: dict[str, Any]) -> str:
+def _now(ctx: ToolContext, args: dict[str, Any]) -> str:
     local = datetime.now().astimezone()
     return _dump(
         {
@@ -57,9 +67,9 @@ def _now(store: Store, args: dict[str, Any]) -> str:
     )
 
 
-def _add_task(store: Store, args: dict[str, Any]) -> str:
+def _add_task(ctx: ToolContext, args: dict[str, Any]) -> str:
     return _dump(
-        store.add_task(
+        ctx.store.add_task(
             title=args["title"],
             due=args.get("due"),
             priority=args.get("priority") or "normal",
@@ -68,13 +78,13 @@ def _add_task(store: Store, args: dict[str, Any]) -> str:
     )
 
 
-def _list_tasks(store: Store, args: dict[str, Any]) -> str:
-    tasks = store.list_tasks(status=args.get("status") or "open", due_before=args.get("due_before"))
+def _list_tasks(ctx: ToolContext, args: dict[str, Any]) -> str:
+    tasks = ctx.store.list_tasks(status=args.get("status") or "open", due_before=args.get("due_before"))
     return _dump({"count": len(tasks), "tasks": tasks})
 
 
-def _update_task(store: Store, args: dict[str, Any]) -> str:
-    task = store.update_task(
+def _update_task(ctx: ToolContext, args: dict[str, Any]) -> str:
+    task = ctx.store.update_task(
         int(args["id"]),
         title=args.get("title"),
         notes=args.get("notes"),
@@ -87,23 +97,23 @@ def _update_task(store: Store, args: dict[str, Any]) -> str:
     return _dump(task)
 
 
-def _delete_task(store: Store, args: dict[str, Any]) -> str:
-    if not store.delete_task(int(args["id"])):
+def _delete_task(ctx: ToolContext, args: dict[str, Any]) -> str:
+    if not ctx.store.delete_task(int(args["id"])):
         raise ValueError(f"no task with id {args['id']}")
     return _dump({"deleted": int(args["id"])})
 
 
-def _add_note(store: Store, args: dict[str, Any]) -> str:
-    return _dump(store.add_note(args["title"], args.get("body") or "", args.get("tags") or []))
+def _add_note(ctx: ToolContext, args: dict[str, Any]) -> str:
+    return _dump(ctx.store.add_note(args["title"], args.get("body") or "", args.get("tags") or []))
 
 
-def _search_notes(store: Store, args: dict[str, Any]) -> str:
-    notes = store.search_notes(args.get("query") or "", limit=int(args.get("limit") or 20))
+def _search_notes(ctx: ToolContext, args: dict[str, Any]) -> str:
+    notes = ctx.store.search_notes(args.get("query") or "", limit=int(args.get("limit") or 20))
     return _dump({"count": len(notes), "notes": notes})
 
 
-def _update_note(store: Store, args: dict[str, Any]) -> str:
-    note = store.update_note(
+def _update_note(ctx: ToolContext, args: dict[str, Any]) -> str:
+    note = ctx.store.update_note(
         int(args["id"]), title=args.get("title"), body=args.get("body"), tags=args.get("tags")
     )
     if note is None:
@@ -111,15 +121,15 @@ def _update_note(store: Store, args: dict[str, Any]) -> str:
     return _dump(note)
 
 
-def _delete_note(store: Store, args: dict[str, Any]) -> str:
-    if not store.delete_note(int(args["id"])):
+def _delete_note(ctx: ToolContext, args: dict[str, Any]) -> str:
+    if not ctx.store.delete_note(int(args["id"])):
         raise ValueError(f"no note with id {args['id']}")
     return _dump({"deleted": int(args["id"])})
 
 
-def _add_event(store: Store, args: dict[str, Any]) -> str:
+def _add_event(ctx: ToolContext, args: dict[str, Any]) -> str:
     return _dump(
-        store.add_event(
+        ctx.store.add_event(
             title=args["title"],
             start=args["start"],
             end=args.get("end"),
@@ -129,28 +139,28 @@ def _add_event(store: Store, args: dict[str, Any]) -> str:
     )
 
 
-def _list_events(store: Store, args: dict[str, Any]) -> str:
-    events = store.list_events(args.get("start"), args.get("end"), limit=int(args.get("limit") or 50))
+def _list_events(ctx: ToolContext, args: dict[str, Any]) -> str:
+    events = ctx.store.list_events(args.get("start"), args.get("end"), limit=int(args.get("limit") or 50))
     return _dump({"count": len(events), "events": events})
 
 
-def _delete_event(store: Store, args: dict[str, Any]) -> str:
-    if not store.delete_event(int(args["id"])):
+def _delete_event(ctx: ToolContext, args: dict[str, Any]) -> str:
+    if not ctx.store.delete_event(int(args["id"])):
         raise ValueError(f"no event with id {args['id']}")
     return _dump({"deleted": int(args["id"])})
 
 
-def _remember(store: Store, args: dict[str, Any]) -> str:
-    return _dump(store.add_memory(args["content"], args.get("category") or "general"))
+def _remember(ctx: ToolContext, args: dict[str, Any]) -> str:
+    return _dump(ctx.store.add_memory(args["content"], args.get("category") or "general"))
 
 
-def _list_memories(store: Store, args: dict[str, Any]) -> str:
-    memories = store.list_memories()
+def _list_memories(ctx: ToolContext, args: dict[str, Any]) -> str:
+    memories = ctx.store.list_memories()
     return _dump({"count": len(memories), "memories": memories})
 
 
-def _forget(store: Store, args: dict[str, Any]) -> str:
-    if not store.delete_memory(int(args["id"])):
+def _forget(ctx: ToolContext, args: dict[str, Any]) -> str:
+    if not ctx.store.delete_memory(int(args["id"])):
         raise ValueError(f"no memory with id {args['id']}")
     return _dump({"deleted": int(args["id"])})
 
@@ -318,7 +328,163 @@ TOOLS: list[Tool] = [
     ),
 ]
 
-TOOLS_BY_NAME: dict[str, Tool] = {t.name: t for t in TOOLS}
+# ------------------------------------------------------------ google tools
+def _google(ctx: ToolContext) -> GoogleClient:
+    if ctx.google is None:
+        raise GoogleNotConnected("Google is not connected. Run: my-assistant google login")
+    return ctx.google
+
+
+def _gcal_list(ctx: ToolContext, args: dict[str, Any]) -> str:
+    events = _google(ctx).list_events(args.get("start"), args.get("end"), int(args.get("limit") or 25))
+    return _dump({"count": len(events), "events": events})
+
+
+def _gcal_create(ctx: ToolContext, args: dict[str, Any]) -> str:
+    return _dump(
+        _google(ctx).create_event(
+            title=args["title"],
+            start=args["start"],
+            end=args.get("end"),
+            location=args.get("location") or "",
+            description=args.get("description") or "",
+            attendees=args.get("attendees") or [],
+        )
+    )
+
+
+def _gcal_delete(ctx: ToolContext, args: dict[str, Any]) -> str:
+    _google(ctx).delete_event(args["id"])
+    return _dump({"deleted": args["id"]})
+
+
+def _gmail_search(ctx: ToolContext, args: dict[str, Any]) -> str:
+    messages = _google(ctx).search_messages(args.get("query") or "", int(args.get("limit") or 10))
+    return _dump({"count": len(messages), "messages": messages})
+
+
+def _gmail_read(ctx: ToolContext, args: dict[str, Any]) -> str:
+    return _dump(_google(ctx).get_message(args["id"]))
+
+
+def _gmail_draft(ctx: ToolContext, args: dict[str, Any]) -> str:
+    return _dump(
+        _google(ctx).create_draft(
+            list(args["to"]), args.get("subject") or "", args["body"], args.get("reply_to_message_id")
+        )
+    )
+
+
+def _gmail_send(ctx: ToolContext, args: dict[str, Any]) -> str:
+    return _dump(
+        _google(ctx).send_message(
+            list(args["to"]), args.get("subject") or "", args["body"], args.get("reply_to_message_id")
+        )
+    )
+
+
+def _gmail_mark_read(ctx: ToolContext, args: dict[str, Any]) -> str:
+    _google(ctx).mark_read(args["id"])
+    return _dump({"marked_read": args["id"]})
+
+
+GOOGLE_TOOLS: list[Tool] = [
+    Tool(
+        "gcal_list_events",
+        "List events from the user's Google Calendar, soonest first. Defaults to the next "
+        "14 days. Use this (not list_events) for the user's real calendar.",
+        _obj(
+            {
+                "start": {"type": "string", "description": f"Range start, {DATETIME_HINT}"},
+                "end": {"type": "string", "description": f"Range end, {DATETIME_HINT}"},
+                "limit": {"type": "integer"},
+            }
+        ),
+        _gcal_list,
+    ),
+    Tool(
+        "gcal_create_event",
+        "Create an event on the user's Google Calendar. Date-only start makes an all-day "
+        "event; a time without an end defaults to one hour.",
+        _obj(
+            {
+                "title": {"type": "string"},
+                "start": {"type": "string", "description": f"Start, {DATETIME_HINT}"},
+                "end": {"type": "string", "description": f"Optional end, {DATETIME_HINT}"},
+                "location": {"type": "string"},
+                "description": {"type": "string"},
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Email addresses to invite.",
+                },
+            },
+            ["title", "start"],
+        ),
+        _gcal_create,
+    ),
+    Tool(
+        "gcal_delete_event",
+        "Delete an event from the user's Google Calendar by its id (from gcal_list_events). "
+        "Confirm with the user first unless they clearly asked for the deletion.",
+        _obj({"id": {"type": "string"}}, ["id"]),
+        _gcal_delete,
+    ),
+    Tool(
+        "gmail_search",
+        "Search the user's Gmail. Uses Gmail search syntax, e.g. 'is:unread', "
+        "'from:alice@example.com', 'subject:invoice newer_than:7d', 'in:inbox'. Empty query "
+        "returns the most recent messages. Returns headers and a snippet, not full bodies.",
+        _obj({"query": {"type": "string"}, "limit": {"type": "integer"}}),
+        _gmail_search,
+    ),
+    Tool(
+        "gmail_read",
+        "Read the full text of one email by message id (from gmail_search).",
+        _obj({"id": {"type": "string"}}, ["id"]),
+        _gmail_read,
+    ),
+    Tool(
+        "gmail_draft",
+        "Create a Gmail draft (not sent). Prefer this over gmail_send unless the user "
+        "explicitly asked you to send. Pass reply_to_message_id to draft a reply in-thread.",
+        _obj(
+            {
+                "to": {"type": "array", "items": {"type": "string"}},
+                "subject": {"type": "string"},
+                "body": {"type": "string", "description": "Plain-text body."},
+                "reply_to_message_id": {"type": "string"},
+            },
+            ["to", "body"],
+        ),
+        _gmail_draft,
+    ),
+    Tool(
+        "gmail_send",
+        "Send an email from the user's Gmail. Only call this after the user has explicitly "
+        "asked to send and has seen the recipient, subject, and body. If unsure, use "
+        "gmail_draft instead. Pass reply_to_message_id to reply in-thread.",
+        _obj(
+            {
+                "to": {"type": "array", "items": {"type": "string"}},
+                "subject": {"type": "string"},
+                "body": {"type": "string", "description": "Plain-text body."},
+                "reply_to_message_id": {"type": "string"},
+            },
+            ["to", "body"],
+        ),
+        _gmail_send,
+    ),
+    Tool(
+        "gmail_mark_read",
+        "Mark an email as read by message id.",
+        _obj({"id": {"type": "string"}}, ["id"]),
+        _gmail_mark_read,
+    ),
+]
+
+GOOGLE_TOOL_NAMES = {t.name for t in GOOGLE_TOOLS}
+TOOLS_BY_NAME: dict[str, Tool] = {t.name: t for t in [*TOOLS, *GOOGLE_TOOLS]}
 
 WEB_SEARCH_TOOL: dict[str, Any] = {
     "type": "web_search_20260209",
@@ -327,20 +493,26 @@ WEB_SEARCH_TOOL: dict[str, Any] = {
 }
 
 
-def tool_definitions(web_search: bool = False) -> list[dict[str, Any]]:
+def tool_definitions(web_search: bool = False, google: bool = False) -> list[dict[str, Any]]:
     """Tool list to send with each request. Order is stable so prompt caching works."""
     defs = [t.definition() for t in TOOLS]
+    if google:
+        defs.extend(t.definition() for t in GOOGLE_TOOLS)
     if web_search:
         defs.append(WEB_SEARCH_TOOL)
     return defs
 
 
-def run_tool(store: Store, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+def run_tool(ctx: ToolContext, name: str, args: dict[str, Any]) -> tuple[str, bool]:
     """Execute a tool. Returns (result_text, is_error)."""
     tool = TOOLS_BY_NAME.get(name)
     if tool is None:
         return f"Error: unknown tool '{name}'", True
     try:
-        return str(tool.handler(store, args or {})), False
-    except (KeyError, ValueError, TypeError) as exc:
+        return str(tool.handler(ctx, args or {})), False
+    except (KeyError, ValueError, TypeError, GoogleNotConnected) as exc:
         return f"Error: {exc}", True
+    except Exception as exc:  # noqa: BLE001 - Google API/network failures surface to the model
+        if name in GOOGLE_TOOL_NAMES:
+            return f"Error talking to Google: {exc}", True
+        raise

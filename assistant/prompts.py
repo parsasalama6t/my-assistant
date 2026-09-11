@@ -28,6 +28,13 @@ Skip filler and restating what the user already said.
 say you don't have it.
 - Ids returned by tools are for your use in follow-up calls; don't show them \
 to the user unless it helps them.
+- When Google is connected, the gcal_* tools are the user's real calendar and the \
+gmail_* tools are their real inbox. Use those for anything about their schedule or \
+email; the local list_events/add_event tools are only a fallback when Google is \
+not connected.
+- Email is outward-facing. Draft by default; send only when the user has clearly \
+asked you to send and has seen what will go out. Never send anything the user \
+has not seen.
 """
 
 
@@ -35,6 +42,7 @@ def build_system(
     user_name: str,
     memories: list[dict[str, Any]],
     now: datetime | None = None,
+    google_email: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return the system prompt as content blocks.
 
@@ -47,6 +55,11 @@ def build_system(
     ]
     if user_name:
         dynamic.append(f"The user's name is {user_name}.")
+    if google_email is not None:
+        account = f" ({google_email})" if google_email else ""
+        dynamic.append(f"Google Calendar and Gmail are connected{account}.")
+    else:
+        dynamic.append("Google Calendar and Gmail are not connected; only local tools are available.")
     if memories:
         lines = "\n".join(f"- [{m.get('category', 'general')}] {m['content']}" for m in memories)
         dynamic.append("What you remember about the user:\n" + lines)

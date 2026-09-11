@@ -43,6 +43,8 @@ class Config:
     web_search: bool = False
     fallbacks: bool = True
     timezone: str = ""
+    google: bool = True  # use Google Calendar/Gmail when a login token exists
+    google_credentials: Path | None = None  # OAuth client file; defaults to <data_dir>/google_credentials.json
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -62,8 +64,18 @@ class Config:
             web_search=_truthy(os.environ.get("ASSISTANT_WEB_SEARCH")),
             fallbacks=_truthy(os.environ.get("ASSISTANT_FALLBACKS", "1")),
             timezone=os.environ.get("ASSISTANT_TIMEZONE", "").strip(),
+            google=_truthy(os.environ.get("ASSISTANT_GOOGLE", "1")),
+            google_credentials=(
+                Path(os.environ["ASSISTANT_GOOGLE_CREDENTIALS"]).expanduser()
+                if os.environ.get("ASSISTANT_GOOGLE_CREDENTIALS")
+                else None
+            ),
         )
 
     @property
     def db_path(self) -> Path:
         return self.data_dir / "assistant.db"
+
+    @property
+    def google_credentials_path(self) -> Path:
+        return self.google_credentials or (self.data_dir / "google_credentials.json")
