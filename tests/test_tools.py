@@ -193,3 +193,70 @@ def test_current_datetime_uses_context_timezone(store: Store) -> None:
     assert data["datetime"].endswith(("-04:00", "-05:00"))
     out, _ = run_tool(ToolContext(store), "get_current_datetime", {})
     assert json.loads(out)["datetime"].endswith("+00:00")
+
+
+# ----------------------------------------------------------------- voice
+from assistant.tools import VOICE_TOOLS  # noqa: E402
+
+
+def _voice_config() -> Config:
+    return Config(
+        timezone="America/Toronto", default_channel="twilio", twilio_account_sid="AC1",
+        twilio_auth_token="tok", twilio_from="+15550001111", user_phone="+14165550100",
+    )
+
+
+def test_voice_flag_adds_call_me() -> None:
+    assert [t.name for t in VOICE_TOOLS] == ["call_me"]
+    assert "call_me" not in {d["name"] for d in tool_definitions()}
+    assert "call_me" not in {d["name"] for d in tool_definitions(scheduling=True)}
+    with_voice = tool_definitions(voice=True)
+    assert len(with_voice) == len(TOOLS) + 1 and with_voice[-1]["name"] == "call_me"
+    everything = tool_definitions(google=True, scheduling=True, voice=True, web_search=True)
+    assert len(everything) == len(TOOLS) + len(GOOGLE_TOOLS) + 3 + 1 + 1
+    assert everything[-1]["name"] == "web_search" and everything[-2]["name"] == "call_me"
+
+
+def test_schedule_message_priority(store: Store) -> None:
+    ctx = ToolContext(store, tz=TORONTO, config=_messaging_config())
+    out, err = run_tool(ctx, "schedule_message", {"text": "x", "when": "2999-01-01T10:00", "priority": "urgent"})
+    assert err and "priority" in out and store.list_schedules() == []
+    out, err = run_tool(ctx, "schedule_message", {"text": "x", "when": "2999-01-01T10:00", "priority": "important"})
+    assert not err, out
+    view = json.loads(out)
+    assert view["priority"] == "important" and store.get_schedule(view["id"])["priority"] == "important"
+    assert "text only" in view["note"]  # no voice in this config
+    out, err = run_tool(ctx, "schedule_message", {"text": "y", "when": "2999-01-01T10:00"})
+    assert not err and json.loads(out)["priority"] == "normal" and "note" not in json.loads(out)
+    voiced = ToolContext(store, tz=TORONTO, config=_voice_config(), place_call=lambda n, t: "CA1")
+    out, err = run_tool(voiced, "schedule_message", {"text": "z", "when": "2999-01-01T10:00", "priority": "CRITICAL"})
+    assert not err and json.loads(out)["priority"] == "critical" and "note" not in json.loads(out)
+    schema = next(d for d in tool_definitions(scheduling=True) if d["name"] == "schedule_message")
+    assert schema["input_schema"]["properties"]["priority"]["enum"] == ["normal", "important", "critical"]
+
+
+def test_call_me_uses_place_call_or_errors(store: Store) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def place_call(to_number: str, text: str) -> str:
+        calls.append((to_number, text))
+        return "CA42"
+
+    ctx = ToolContext(store, config=_voice_config(), place_call=place_call)
+    out, err = run_tool(ctx, "call_me", {"text": "  Your  flight\nboards now. "})
+    assert not err, out
+    assert json.loads(out) == {"called": "+14165550100", "call_id": "CA42", "text": "Your flight boards now."}
+    assert calls == [("+14165550100", "Your flight boards now.")]
+
+    out, err = run_tool(ctx, "call_me", {"text": "   "})
+    assert err and "empty" in out
+    out, err = run_tool(ToolContext(store, config=_voice_config()), "call_me", {"text": "hi"})
+    assert err and "not set up" in out
+    out, err = run_tool(ToolContext(store, place_call=place_call), "call_me", {"text": "hi"})
+    assert err and "not set up" in out  # no USER_PHONE without a config
+
+    def broken(to_number: str, text: str) -> str:
+        raise RuntimeError("Twilio refused the call")
+
+    out, err = run_tool(ToolContext(store, config=_voice_config(), place_call=broken), "call_me", {"text": "hi"})
+    assert err and "Twilio refused" in out

@@ -11,7 +11,7 @@ from assistant.config import Config
 from assistant.scheduler import Scheduler
 from assistant.schedule_rules import to_utc_iso
 from assistant.store import Store
-from tests.fakes import FakeClock, FakeGoogleCalendar, FakeRenderer, FakeSender, strict_renderer
+from tests.fakes import FakeCaller, FakeClock, FakeGoogleCalendar, FakeRenderer, FakeSender, strict_renderer
 
 TORONTO = ZoneInfo("America/Toronto")
 
@@ -35,13 +35,20 @@ def cfg() -> Config:
     )
 
 
-def make(store: Store, cfg: Config, clock: FakeClock, render=None, google=None, sender=None):
+def make(store: Store, cfg: Config, clock: FakeClock, render=None, google=None, sender=None, caller=None):
     sender = sender or FakeSender()
     sched = Scheduler(
         store, cfg, send=sender, render_briefing=render or strict_renderer, google=google,
-        now_fn=clock.now, log=logging.getLogger("test.scheduler"),
+        now_fn=clock.now, log=logging.getLogger("test.scheduler"), place_call=caller,
     )
     return sched, sender
+
+
+@pytest.fixture
+def voice_cfg(cfg: Config) -> Config:
+    cfg.user_phone = "+14165550100"
+    cfg.escalate_minutes = 10
+    return cfg
 
 
 # --------------------------------------------------------------- tick
@@ -363,3 +370,139 @@ def test_run_forever_recovers_stale_deliveries_and_stops(store: Store, cfg: Conf
     assert store.list_deliveries()[0]["status"] == "failed"
     assert {r["source"] for r in store.schedules_by_source_prefix("system:")} == {"system:morning", "system:evening"}
     assert sender.sent == []  # the stale row's firing was already claimed
+
+
+# ---------------------------------------------------------------- calls
+def test_important_row_texts_then_escalates_to_a_call(store: Store, voice_cfg: Config) -> None:
+    clock = FakeClock(utc(2026, 9, 11, 12, 0))
+    caller = FakeCaller()
+    sched, sender = make(store, voice_cfg, clock, caller=caller)
+    row = store.add_schedule(
+        "custom", "telegram", "42", to_utc_iso(clock.now()), "America/Toronto",
+        text="Take your meds", priority="important",
+    )
+    report = sched.tick()
+    assert sender.sent == [("telegram", "42", "Take your meds")]
+    assert caller.calls == []  # not yet
+    assert report.sent[0]["priority"] == "important" and report.sent[0]["via"] == "text"
+
+    esc = store.schedules_by_source_prefix("escalate:")
+    assert len(esc) == 1
+    esc = esc[0]
+    assert esc["source"] == f"escalate:{row['id']}:{row['next_run_utc']}"
+    assert esc["kind"] == "call" and esc["priority"] == "critical" and esc["enabled"] == 1
+    assert esc["text"] == "Take your meds"
+    assert (esc["channel"], esc["chat_id"], esc["tz"]) == ("telegram", "42", "America/Toronto")
+    assert esc["next_run_utc"] == "2026-09-11T12:10:00+00:00"
+
+    clock.advance(minutes=9)
+    assert sched.tick().sent == [] and caller.calls == []
+    clock.advance(minutes=1)
+    report = sched.tick()
+    assert caller.calls == [("+14165550100", "Take your meds")]
+    assert len(sender.sent) == 1  # a call row never sends a text
+    assert len(report.sent) == 1
+    assert report.sent[0]["kind"] == "call" and report.sent[0]["via"] == "call"
+    assert report.sent[0]["provider_message_id"] == "CA1"
+    assert store.get_schedule(esc["id"])["enabled"] == 0
+    statuses = {d["schedule_id"]: d for d in store.list_deliveries()}
+    assert statuses[esc["id"]]["status"] == "sent" and statuses[esc["id"]]["provider_message_id"] == "CA1"
+
+
+def test_cancelled_escalation_does_not_call(store: Store, voice_cfg: Config) -> None:
+    clock = FakeClock(utc(2026, 9, 11, 12, 0))
+    caller = FakeCaller()
+    sched, sender = make(store, voice_cfg, clock, caller=caller)
+    store.add_schedule("custom", "telegram", "42", to_utc_iso(clock.now()), "America/Toronto", text="Leave now", priority="important")
+    sched.tick()
+    assert store.cancel_escalations("telegram", "42") == 1
+    clock.advance(minutes=15)
+    assert sched.tick().sent == [] and caller.calls == []
+
+
+def test_critical_row_texts_and_calls_in_one_tick(store: Store, voice_cfg: Config) -> None:
+    clock = FakeClock(utc(2026, 9, 11, 12, 0))
+    caller = FakeCaller()
+    sched, sender = make(store, voice_cfg, clock, caller=caller)
+    row = store.add_schedule("custom", "telegram", "42", to_utc_iso(clock.now()), "America/Toronto", text="Flight boards now", priority="critical")
+    report = sched.tick()
+    assert sender.sent == [("telegram", "42", "Flight boards now")]
+    assert caller.calls == [("+14165550100", "Flight boards now")]
+    assert [(s["id"], s["via"]) for s in report.sent] == [(row["id"], "text"), (row["id"], "call")]
+    assert report.failed == []
+    assert store.schedules_by_source_prefix("escalate:") == []  # no follow-up needed
+    assert len(store.list_deliveries()) == 1 and store.list_deliveries()[0]["status"] == "sent"
+
+
+def test_critical_call_failure_keeps_the_text_sent(store: Store, voice_cfg: Config) -> None:
+    clock = FakeClock(utc(2026, 9, 11, 12, 0))
+    caller = FakeCaller()
+    caller.fail_with = RuntimeError("twilio down")
+    sched, sender = make(store, voice_cfg, clock, caller=caller)
+    store.add_schedule("custom", "telegram", "42", to_utc_iso(clock.now()), "America/Toronto", text="x", priority="critical")
+    report = sched.tick()
+    assert len(sender.sent) == 1
+    assert len(report.sent) == 1 and report.sent[0]["via"] == "text"
+    assert len(report.failed) == 1 and report.failed[0]["via"] == "call" and "twilio down" in report.failed[0]["error"]
+    assert store.list_deliveries()[0]["status"] == "sent"
+
+
+def test_call_kind_without_voice_fails_and_sends_nothing(store: Store, voice_cfg: Config) -> None:
+    clock = FakeClock(utc(2026, 9, 11, 12, 0))
+    sched, sender = make(store, voice_cfg, clock)  # no place_call
+    row = store.add_schedule("call", "telegram", "42", to_utc_iso(clock.now()), "America/Toronto", text="ring ring", priority="critical")
+    report = sched.tick()
+    assert sender.sent == []
+    assert report.sent == []
+    assert report.failed[0]["id"] == row["id"] and report.failed[0]["error"] == "voice not configured"
+    assert report.failed[0]["via"] == "call"
+    assert store.list_deliveries()[0]["status"] == "failed"
+    assert store.list_deliveries()[0]["error"] == "voice not configured"
+    assert store.get_schedule(row["id"])["enabled"] == 0
+
+
+def test_priorities_without_voice_send_text_only(store: Store, cfg: Config) -> None:
+    clock = FakeClock(utc(2026, 9, 11, 12, 0))
+    sched, sender = make(store, cfg, clock)  # no user_phone, no caller
+    at = to_utc_iso(clock.now())
+    store.add_schedule("custom", "telegram", "42", at, "America/Toronto", text="important", priority="important")
+    store.add_schedule("custom", "telegram", "42", at, "America/Toronto", text="critical", priority="critical")
+    report = sched.tick()
+    assert sorted(s[2] for s in sender.sent) == ["critical", "important"]
+    assert report.failed == [] and len(report.sent) == 2
+    assert store.schedules_by_source_prefix("escalate:") == []
+
+
+def test_late_call_row_is_skipped(store: Store, voice_cfg: Config) -> None:
+    fire = utc(2026, 9, 11, 12, 0)
+    clock = FakeClock(fire)
+    clock.advance(minutes=voice_cfg.catchup_grace_minutes + 1)
+    caller = FakeCaller()
+    sched, sender = make(store, voice_cfg, clock, caller=caller)
+    store.add_schedule("call", "telegram", "42", to_utc_iso(fire), "America/Toronto", text="old", source="escalate:1:x")
+    report = sched.tick()
+    assert caller.calls == [] and sender.sent == []
+    assert report.skipped[0]["reason"] == "late" and report.skipped[0]["kind"] == "call"
+
+
+def test_high_priority_task_gets_an_important_reminder(store: Store, voice_cfg: Config) -> None:
+    clock = FakeClock(utc(2026, 9, 11, 12, 0))
+    caller = FakeCaller()
+    sched, sender = make(store, voice_cfg, clock, caller=caller)
+    urgent = store.add_task("File taxes", due="2026-09-11T08:05", priority="high")  # 12:05Z
+    store.add_task("Water plants", due="2026-09-11T08:05")
+    sched.sync_auto_reminders()
+    rows = {r["source"]: r for r in store.schedules_by_source_prefix("task:")}
+    assert rows[f"task:{urgent['id']}"]["priority"] == "important"
+    assert [r["priority"] for r in rows.values()].count("normal") == 1
+
+    clock.advance(minutes=5)
+    sched.run_once()
+    assert len(sender.sent) == 2 and caller.calls == []
+    esc = store.schedules_by_source_prefix("escalate:")
+    assert len(esc) == 1 and esc[0]["text"] == "Reminder: File taxes is due now."
+
+    clock.advance(minutes=10)
+    sched.run_once()  # the sync must not disturb the pending escalation
+    assert caller.calls == [("+14165550100", "Reminder: File taxes is due now.")]
+    assert len(sender.sent) == 2

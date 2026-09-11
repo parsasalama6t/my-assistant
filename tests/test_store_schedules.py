@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from assistant.store import Store
@@ -155,3 +157,82 @@ def test_wal_mode_on_disk(tmp_path) -> None:
     assert s.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert s.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     s.close()
+
+
+# ------------------------------------------------------------ priority
+def test_priority_and_call_kind(store: Store) -> None:
+    row = _add(store)
+    assert row["priority"] == "normal"
+    row = _add(store, priority="important")
+    assert row["priority"] == "important"
+    call = _add(store, kind="call", priority="critical")
+    assert call["kind"] == "call" and call["priority"] == "critical"
+    with pytest.raises(ValueError, match="priority"):
+        _add(store, priority="urgent")
+    with pytest.raises(ValueError, match="priority"):
+        store.upsert_schedule_by_source("x:1", kind="custom", channel="telegram", chat_id="1", next_run_utc="2026-09-12T12:00:00+00:00", tz=TZ, priority="loud")
+    up = store.upsert_schedule_by_source("x:1", kind="custom", channel="telegram", chat_id="1", next_run_utc="2026-09-12T12:00:00+00:00", tz=TZ, priority="important")
+    assert up["priority"] == "important"
+    up = store.upsert_schedule_by_source("x:1", kind="custom", channel="telegram", chat_id="1", next_run_utc="2026-09-12T12:00:00+00:00", tz=TZ)
+    assert up["priority"] == "normal"  # conflict updates priority too
+
+
+def test_cancel_by_source_prefix_and_escalations(store: Store) -> None:
+    a = _add(store, kind="call", source="escalate:1:t", chat_id="42")
+    b = _add(store, kind="call", source="escalate:2:t", chat_id="42")
+    c = _add(store, kind="call", source="escalate:3:t", chat_id="99")
+    keep = _add(store, source="task:1")
+    store.cancel_schedule(b["id"])  # already off; must not be counted again
+    assert store.cancel_escalations("telegram", "42") == 1
+    assert store.get_schedule(a["id"])["enabled"] == 0 and store.get_schedule(c["id"])["enabled"] == 1
+    assert store.cancel_escalations("telegram", "42") == 0
+    assert store.cancel_schedules_by_source_prefix("escalate:") == 1
+    assert store.get_schedule(c["id"])["enabled"] == 0 and store.get_schedule(keep["id"])["enabled"] == 1
+    with pytest.raises(ValueError):
+        store.cancel_schedules_by_source_prefix("")
+
+
+OLD_SCHEDULED_MESSAGES = """
+CREATE TABLE scheduled_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    next_run_utc TEXT NOT NULL,
+    repeat TEXT,
+    local_time TEXT,
+    tz TEXT NOT NULL,
+    source TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_sent_utc TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def test_migration_adds_priority_to_an_existing_database(tmp_path) -> None:
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(OLD_SCHEDULED_MESSAGES)
+    conn.execute(
+        "INSERT INTO scheduled_messages (kind, text, channel, chat_id, next_run_utc, tz, created_at)"
+        " VALUES ('custom', 'old row', 'telegram', '42', '2026-09-12T12:00:00+00:00', 'UTC', '2026-09-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    try:
+        columns = {r[1] for r in store.conn.execute("PRAGMA table_info(scheduled_messages)").fetchall()}
+        assert "priority" in columns
+        old = store.list_schedules()[0]
+        assert old["text"] == "old row" and old["priority"] == "normal"
+        new = _add(store, priority="critical")
+        assert store.get_schedule(new["id"])["priority"] == "critical"
+    finally:
+        store.close()
+    # Reopening is idempotent.
+    again = Store(path)
+    assert len(again.list_schedules()) == 2
+    again.close()

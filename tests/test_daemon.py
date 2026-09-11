@@ -12,6 +12,7 @@ from assistant.scheduler import TickReport
 from assistant.schedule_rules import to_utc_iso
 from assistant.store import Store
 from tests.conftest import FakeClient, make_message, text, tool_use
+from tests.fakes import FakeVoice
 
 
 class FakeChannel(Channel):
@@ -46,7 +47,7 @@ def tg_config() -> Config:
 
 
 def make_daemon(
-    store: Store, config: Config, responses: list, allowed={"111"}, max_len: int = 4096
+    store: Store, config: Config, responses: list, allowed={"111"}, max_len: int = 4096, voice=None
 ) -> tuple[Daemon, FakeChannel, FakeClient]:
     channel = FakeChannel(set(allowed), max_len=max_len)
     client = FakeClient(responses)
@@ -56,6 +57,7 @@ def make_daemon(
         client=client,
         channels={"telegram": channel},
         log=logging.getLogger("test.daemon"),
+        voice=voice,
     )
     return daemon, channel, client
 
@@ -243,3 +245,89 @@ def test_run_refuses_without_channels(tg_config: Config, store: Store) -> None:
     daemon = Daemon(tg_config, store_factory=lambda: store, channels={})
     with pytest.raises(ChannelError):
         daemon.run()
+
+
+# ---------------------------------------------------------------- voice
+def _escalation(store: Store, chat_id: str, source: str) -> dict:
+    return store.upsert_schedule_by_source(
+        source, kind="call", text="Leave now", channel="telegram", chat_id=chat_id,
+        next_run_utc=to_utc_iso(datetime.now(timezone.utc) + timedelta(minutes=5)),
+        tz="America/Toronto", priority="critical",
+    )
+
+
+def test_inbound_reply_cancels_pending_escalations_for_that_chat(store: Store, tg_config: Config) -> None:
+    tg_config.telegram_chat_ids = ["111", "222"]
+    daemon, channel, client = make_daemon(
+        store, tg_config, [make_message([text("Great, glad you saw it.")])], allowed={"111", "222"}
+    )
+    mine = _escalation(store, "111", "escalate:1:2026-09-11T12:00:00+00:00")
+    mine2 = _escalation(store, "111", "escalate:2:2026-09-11T12:05:00+00:00")
+    theirs = _escalation(store, "222", "escalate:3:2026-09-11T12:00:00+00:00")
+    user_row = store.add_schedule("custom", "telegram", "111", mine["next_run_utc"], "America/Toronto", text="keep me")
+
+    assert daemon.handle_inbound(inbound("on my way")) == "Great, glad you saw it."
+    assert store.get_schedule(mine["id"])["enabled"] == 0
+    assert store.get_schedule(mine2["id"])["enabled"] == 0
+    assert store.get_schedule(theirs["id"])["enabled"] == 1  # other chat untouched
+    assert store.get_schedule(user_row["id"])["enabled"] == 1  # only escalations are cancelled
+
+    # A message from an unknown chat cancels nothing.
+    assert daemon.handle_inbound(inbound("hello", chat_id="999", message_id="9")) is None
+    assert store.get_schedule(theirs["id"])["enabled"] == 1
+    # A local command counts as a reply too.
+    daemon.handle_inbound(inbound("/tasks", chat_id="222", message_id="10"))
+    assert store.get_schedule(theirs["id"])["enabled"] == 0
+
+
+def test_call_me_tool_places_a_call_through_the_daemon(store: Store, tg_config: Config) -> None:
+    tg_config.user_phone = "+14165550100"
+    voice = FakeVoice()
+    daemon, channel, client = make_daemon(
+        store,
+        tg_config,
+        [
+            make_message([tool_use("call_me", {"text": "The oven is still on."})], stop_reason="tool_use"),
+            make_message([text("Calling you now.")]),
+        ],
+        voice=voice,
+    )
+    assert daemon.voice_enabled
+    assert daemon.handle_inbound(inbound("call me and say the oven is on")) == "Calling you now."
+    assert voice.calls == [("+14165550100", "The oven is still on.")]
+    assert "call_me" in {t["name"] for t in client.calls[0]["tools"]}
+    tool_results = client.calls[1]["messages"][-1]["content"]
+    assert not tool_results[0].get("is_error") and "CA1" in tool_results[0]["content"]
+    assert daemon.place_call("+14165550100", "again") == "CA2"
+    daemon.close()
+    assert voice.closed
+
+
+def test_call_me_without_voice_is_a_tool_error_not_a_crash(store: Store, tg_config: Config) -> None:
+    daemon, channel, client = make_daemon(
+        store,
+        tg_config,
+        [
+            make_message([tool_use("call_me", {"text": "hi"})], stop_reason="tool_use"),
+            make_message([text("I can't call you from here.")]),
+        ],
+    )
+    assert not daemon.voice_enabled
+    assert daemon.handle_inbound(inbound("call me")) == "I can't call you from here."
+    assert "call_me" not in {t["name"] for t in client.calls[0]["tools"]}
+    tool_results = client.calls[1]["messages"][-1]["content"]
+    assert tool_results[0].get("is_error") and "not set up" in tool_results[0]["content"]
+
+
+def test_run_once_fires_a_critical_row_as_text_and_call(store: Store, tg_config: Config) -> None:
+    tg_config.user_phone = "+14165550100"
+    voice = FakeVoice()
+    daemon, channel, client = make_daemon(store, tg_config, [], voice=voice)
+    store.add_schedule(
+        "custom", "telegram", "111", to_utc_iso(datetime.now(timezone.utc) - timedelta(minutes=1)),
+        "America/Toronto", text="Gate closes in 10", priority="critical",
+    )
+    report = daemon.run_once()
+    assert channel.sent == [("111", "Gate closes in 10")]
+    assert voice.calls == [("+14165550100", "Gate closes in 10")]
+    assert [s["via"] for s in report.sent] == ["text", "call"]

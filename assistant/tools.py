@@ -20,7 +20,7 @@ from assistant.schedule_rules import (
     parse_repeat,
     to_utc_iso,
 )
-from assistant.store import AUTO_SOURCE_PREFIXES, Store
+from assistant.store import AUTO_SOURCE_PREFIXES, SCHEDULE_PRIORITIES, Store
 
 if TYPE_CHECKING:
     from assistant.config import Config
@@ -31,7 +31,9 @@ class ToolContext:
     """Everything a tool handler may need.
 
     `channel`/`chat_id` identify the chat a request came from (None for the CLI
-    or web UI); `config` supplies the default messaging target and allowlists.
+    or web UI); `config` supplies the default messaging target and allowlists;
+    `place_call(to_number, text)` rings the user's phone and returns a call id
+    (None when phone calls are not set up).
     """
 
     store: Store
@@ -40,6 +42,7 @@ class ToolContext:
     channel: str | None = None
     chat_id: str | None = None
     config: "Config | None" = None
+    place_call: Callable[[str, str], Any] | None = None
 
 
 Handler = Callable[["ToolContext", dict[str, Any]], Any]
@@ -537,6 +540,7 @@ def _schedule_view(row: dict[str, Any], tz: tzinfo) -> dict[str, Any]:
         "next_run": format_local(row["next_run_utc"], tz),
         "repeat": row["repeat"],
         "channel": row["channel"],
+        "priority": row.get("priority") or "normal",
     }
     if row.get("source"):
         out["source"] = row["source"]
@@ -547,6 +551,9 @@ def _schedule_message(ctx: ToolContext, args: dict[str, Any]) -> str:
     text = (args.get("text") or "").strip()
     if not text:
         raise ValueError("text cannot be empty")
+    priority = (args.get("priority") or "normal").strip().lower()
+    if priority not in SCHEDULE_PRIORITIES:
+        raise ValueError(f"priority must be one of {', '.join(SCHEDULE_PRIORITIES)}; got {priority!r}")
     channel, chat_id = _target(ctx)
     first = parse_local_datetime(args.get("when") or "", ctx.tz)
     now = datetime.now(timezone.utc)
@@ -571,8 +578,12 @@ def _schedule_message(ctx: ToolContext, args: dict[str, Any]) -> str:
         text=text,
         repeat=rule,
         local_time=local_time,
+        priority=priority,
     )
-    return _dump(_schedule_view(row, ctx.tz))
+    view = _schedule_view(row, ctx.tz)
+    if priority != "normal" and not (ctx.config is not None and ctx.config.has_voice()):
+        view["note"] = "Phone calls are not set up, so this will be a text only."
+    return _dump(view)
 
 
 def _list_scheduled(ctx: ToolContext, args: dict[str, Any]) -> str:
@@ -596,6 +607,13 @@ def _cancel_scheduled(ctx: ToolContext, args: dict[str, Any]) -> str:
     return _dump({"cancelled": schedule_id, "text": row["text"], "kind": row["kind"]})
 
 
+PRIORITY_HINT = (
+    "normal = a text. important = a text, then a phone call if the user has not replied "
+    "within about 10 minutes. critical = a phone call right away plus the text. Default "
+    "normal; use important or critical only when the user signals it matters (deadlines, "
+    "flights, medication, 'make sure', 'call me')."
+)
+
 SCHEDULE_TOOLS: list[Tool] = [
     Tool(
         "schedule_message",
@@ -603,7 +621,8 @@ SCHEDULE_TOOLS: list[Tool] = [
         "repeat. Call get_current_datetime first so 'when' is right. Messages are phone "
         "texts: keep the text short and self-contained (it is sent verbatim, with no "
         "other context). Tasks with due times and calendar events are texted "
-        "automatically, so do not schedule duplicates for those.\n" + REPEAT_RULES,
+        "automatically, so do not schedule duplicates for those. Priority controls "
+        "whether the phone also rings: " + PRIORITY_HINT + "\n" + REPEAT_RULES,
         _obj(
             {
                 "text": {"type": "string", "description": "The message to send, verbatim."},
@@ -614,6 +633,11 @@ SCHEDULE_TOOLS: list[Tool] = [
                 "repeat": {
                     "type": "string",
                     "description": "Optional: daily | weekdays | weekends | weekly | days:mon,wed",
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": list(SCHEDULE_PRIORITIES),
+                    "description": PRIORITY_HINT,
                 },
             },
             ["text", "when"],
@@ -636,7 +660,38 @@ SCHEDULE_TOOLS: list[Tool] = [
     ),
 ]
 
-TOOLS_BY_NAME: dict[str, Tool] = {t.name: t for t in [*TOOLS, *GOOGLE_TOOLS, *SCHEDULE_TOOLS]}
+
+# ------------------------------------------------------------- voice tools
+def _call_me(ctx: ToolContext, args: dict[str, Any]) -> str:
+    text = " ".join((args.get("text") or "").split())
+    if not text:
+        raise ValueError("text cannot be empty")
+    to_number = ctx.config.user_phone if ctx.config is not None else ""
+    if ctx.place_call is None or not to_number:
+        raise ValueError(
+            "Phone calls are not set up. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, a voice number "
+            "(TWILIO_VOICE_FROM or TWILIO_FROM) and USER_PHONE, then restart."
+        )
+    call_id = ctx.place_call(to_number, text)
+    return _dump({"called": to_number, "call_id": call_id, "text": text})
+
+
+VOICE_TOOLS: list[Tool] = [
+    Tool(
+        "call_me",
+        "Place a phone call to the user right now and read `text` aloud (twice), then hang "
+        "up. Reserve this for things that genuinely matter or when the user asks to be "
+        "called; a text is the default. Keep the text to one or two spoken sentences.",
+        _obj({"text": {"type": "string", "description": "What to say on the call, verbatim."}}, ["text"]),
+        _call_me,
+    ),
+]
+
+VOICE_TOOL_NAMES = {t.name for t in VOICE_TOOLS}
+
+TOOLS_BY_NAME: dict[str, Tool] = {
+    t.name: t for t in [*TOOLS, *GOOGLE_TOOLS, *SCHEDULE_TOOLS, *VOICE_TOOLS]
+}
 
 WEB_SEARCH_TOOL: dict[str, Any] = {
     "type": "web_search_20260209",
@@ -646,7 +701,7 @@ WEB_SEARCH_TOOL: dict[str, Any] = {
 
 
 def tool_definitions(
-    web_search: bool = False, google: bool = False, scheduling: bool = False
+    web_search: bool = False, google: bool = False, scheduling: bool = False, voice: bool = False
 ) -> list[dict[str, Any]]:
     """Tool list to send with each request. Order is stable so prompt caching works."""
     defs = [t.definition() for t in TOOLS]
@@ -654,6 +709,8 @@ def tool_definitions(
         defs.extend(t.definition() for t in GOOGLE_TOOLS)
     if scheduling:
         defs.extend(t.definition() for t in SCHEDULE_TOOLS)
+    if voice:
+        defs.extend(t.definition() for t in VOICE_TOOLS)
     if web_search:
         defs.append(WEB_SEARCH_TOOL)
     return defs
@@ -668,7 +725,9 @@ def run_tool(ctx: ToolContext, name: str, args: dict[str, Any]) -> tuple[str, bo
         return str(tool.handler(ctx, args or {})), False
     except (KeyError, ValueError, TypeError, GoogleNotConnected) as exc:
         return f"Error: {exc}", True
-    except Exception as exc:  # noqa: BLE001 - Google API/network failures surface to the model
+    except Exception as exc:  # noqa: BLE001 - Google/Twilio API failures surface to the model
         if name in GOOGLE_TOOL_NAMES:
             return f"Error talking to Google: {exc}", True
+        if name in VOICE_TOOL_NAMES:
+            return f"Error placing the call: {exc}", True
         raise

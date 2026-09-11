@@ -58,6 +58,7 @@ class Assistant:
         google: Any | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        place_call: Callable[[str, str], Any] | None = None,
     ) -> None:
         self.store = store
         self.config = config
@@ -65,6 +66,11 @@ class Assistant:
         self.google = google
         self.channel = channel
         self.chat_id = chat_id
+        # The daemon passes its own caller; a plain CLI chat builds one on first use.
+        if place_call is None and config.has_voice():
+            place_call = self._default_place_call
+        self.place_call = place_call
+        self._voice: Any | None = None
         self.tools = ToolContext(
             store=store,
             google=google,
@@ -72,8 +78,17 @@ class Assistant:
             channel=channel,
             chat_id=chat_id,
             config=config,
+            place_call=place_call,
         )
         self.session_id = session_id or store.latest_session() or store.create_session()
+
+    # --------------------------------------------------------------- voice
+    def _default_place_call(self, to_number: str, text: str) -> str:
+        if self._voice is None:
+            from assistant.voice import build_voice
+
+            self._voice = build_voice(self.config)
+        return self._voice.call(to_number, text)
 
     # ------------------------------------------------------------ sessions
     def new_session(self, title: str = "") -> str:
@@ -102,6 +117,7 @@ class Assistant:
                 web_search=self.config.web_search,
                 google=self.google is not None,
                 scheduling=self.config.has_messaging(),
+                voice=self.place_call is not None,
             ),
             thinking={"type": "adaptive"},
             output_config={"effort": self.config.effort},

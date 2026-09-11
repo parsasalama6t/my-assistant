@@ -1,4 +1,8 @@
-"""A terminal channel used by `my-assistant demo`: stdin in, stdout out."""
+"""A terminal channel used by `my-assistant demo`: stdin in, stdout out.
+
+`ConsoleVoice` is the matching stand-in for phone calls: it prints what the
+assistant would have said on the call instead of dialling anything.
+"""
 
 from __future__ import annotations
 
@@ -87,3 +91,23 @@ class ConsoleChannel(Channel):
 
     def is_allowed(self, chat_id: str) -> bool:
         return chat_id == CHAT_ID
+
+
+class ConsoleVoice:
+    """Prints "[assistant CALLS you] ..." where the real daemon would place a call."""
+
+    def __init__(self, stdout: TextIO | None = None, prompt: str = "you> ") -> None:
+        self.stdout = stdout or sys.stdout
+        self.prompt = prompt
+        self.calls: list[tuple[str, str]] = []
+        self._lock = threading.Lock()
+
+    def call(self, to_number: str, text: str, repeat: int = 2) -> str:
+        with self._lock:
+            self.calls.append((to_number, text))
+            self.stdout.write(f"\r[assistant CALLS you] \u260e {text}\n{self.prompt}")
+            self.stdout.flush()
+            return f"console-call-{len(self.calls)}"
+
+    def close(self) -> None:
+        return None

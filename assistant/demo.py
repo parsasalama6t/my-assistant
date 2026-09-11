@@ -21,19 +21,23 @@ This runs the real daemon, scheduler and tools against a scratch database.
 Replies are SCRIPTED until you set ANTHROPIC_API_KEY (see .env.example); no
 messages leave this terminal. Try:
   text me in 1 minute to stretch      (a real schedule that fires while you watch)
+  call me in 1 minute to leave        (a critical schedule: it texts AND "calls")
+  call me and say the oven is on      (a phone call right now, printed here)
   add task call the dentist tomorrow
   tasks   ·   remember that I take Fridays off   ·   /schedule   ·   /help
 Ctrl-D or /quit exits."""
 
 _SCRIPTED_NOTE = (
     "(demo) I only understand a few phrasings without an API key. Try "
-    "'text me in 2 minutes to stretch', 'add task buy milk', 'tasks', or "
-    "'remember that I work out on Tuesdays'."
+    "'text me in 2 minutes to stretch', 'call me in 1 minute to leave', 'add task buy milk', "
+    "'tasks', or 'remember that I work out on Tuesdays'."
 )
 
 _IN_RE = re.compile(r"\bin\s+(\d+)\s*(min|mins|minute|minutes|hour|hours|h|m)\b", re.I)
 _AT_RE = re.compile(r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.I)
 _ISO_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})\b")
+_CALL_RE = re.compile(r"\bcall\s+me\b", re.I)
+_TASK_RE = re.compile(r"(?:add (?:a )?task|todo|remind me to|i need to)[:,]?\s+(.+)", re.I)
 
 
 def _message(blocks: list[Any], stop_reason: str = "end_turn") -> Message:
@@ -135,6 +139,14 @@ class ScriptedClient:
         body = _AT_RE.sub("", body).strip(" .,")
         return body or "This is your scheduled text from the demo."
 
+    @staticmethod
+    def _call_text(text: str) -> str:
+        """'call me and say the oven is on' / 'call me about the oven' -> what to say."""
+        stripped = _AT_RE.sub("", _IN_RE.sub("", text))
+        m = re.search(r"\bcall\s+me\b[\s,]*(?:and\s+)?(?:say|tell me|about|that|to)?\s*(.+)$", stripped, re.I)
+        body = m.group(1).strip(" .,") if m else ""
+        return body or "This is your assistant calling from the demo."
+
     # -------------------------------------------------------- responses
     def _after_tool(self, history: list[dict[str, Any]]) -> Message:
         results = history[-1]["content"]
@@ -152,9 +164,14 @@ class ScriptedClient:
         except (ValueError, TypeError):
             data = {}
         if tool_name == "schedule_message":
-            return _message(
-                [_text(f"Done. I'll text you \"{data.get('text', '')}\" at {data.get('next_run', '?')}.")]
+            verb = {"critical": "call and text", "important": "text (and call if you don't reply)"}.get(
+                data.get("priority", "normal"), "text"
             )
+            return _message(
+                [_text(f"Done. I'll {verb} you \"{data.get('text', '')}\" at {data.get('next_run', '?')}.")]
+            )
+        if tool_name == "call_me":
+            return _message([_text("Calling you now.")])
         if tool_name == "add_task":
             due = f" (due {data['due']})" if data.get("due") else ""
             return _message([_text(f"Added \"{data.get('title', '')}\"{due}.")])
@@ -193,6 +210,20 @@ class ScriptedClient:
         if low.startswith("give me my briefing") or low.startswith("give me my evening review"):
             self._briefing_pending = True
             return _message([_tool("list_tasks", {"status": "open"})], stop_reason="tool_use")
+        if _CALL_RE.search(low) and not _TASK_RE.match(text):
+            when = self.parse_when(text)
+            if when is None:
+                return _message(
+                    [_text("Calling you.\n"), _tool("call_me", {"text": self._call_text(text)})],
+                    stop_reason="tool_use",
+                )
+            return _message(
+                [
+                    _text("Scheduling a call.\n"),
+                    _tool("schedule_message", {"text": self._call_text(text), "when": when, "priority": "critical"}),
+                ],
+                stop_reason="tool_use",
+            )
         if re.search(r"\b(text|message|ping|remind)\s+me\b", low) and not low.startswith("remind me to "):
             when = self.parse_when(text)
             if when is None:
@@ -204,7 +235,7 @@ class ScriptedClient:
                 ],
                 stop_reason="tool_use",
             )
-        m = re.match(r"(?:add (?:a )?task|todo|remind me to|i need to)\s+(.+)", text, re.I)
+        m = _TASK_RE.match(text)
         if m:
             title = m.group(1).strip(" .")
             due = None

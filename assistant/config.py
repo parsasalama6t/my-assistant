@@ -82,6 +82,7 @@ class Config:
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_from: str = ""  # SMS sender number; leave empty to use WhatsApp only
+    twilio_voice_from: str = ""  # voice-capable number for calls; defaults to twilio_from
     twilio_whatsapp_from: str = "whatsapp:+14155238886"
     twilio_webhook_url: str = ""
     twilio_webhook_port: int = 8081
@@ -95,6 +96,7 @@ class Config:
     catchup_grace_minutes: int = 120
     tick_seconds: int = 30
     session_idle_hours: int = 12
+    escalate_minutes: int = 10  # 'important' texts turn into a call after this long without a reply
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -156,6 +158,7 @@ class Config:
             twilio_account_sid=twilio_sid,
             twilio_auth_token=_env("TWILIO_AUTH_TOKEN"),
             twilio_from=_env("TWILIO_FROM"),
+            twilio_voice_from=_env("TWILIO_VOICE_FROM") or _env("TWILIO_FROM"),
             twilio_whatsapp_from=os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886").strip(),
             twilio_webhook_url=_env("TWILIO_WEBHOOK_URL"),
             twilio_webhook_port=_int_env("TWILIO_WEBHOOK_PORT", 8081),
@@ -167,6 +170,7 @@ class Config:
             catchup_grace_minutes=_int_env("ASSISTANT_CATCHUP_GRACE_MINUTES", 120),
             tick_seconds=_int_env("ASSISTANT_TICK_SECONDS", 30),
             session_idle_hours=_int_env("ASSISTANT_SESSION_IDLE_HOURS", 12),
+            escalate_minutes=_int_env("ASSISTANT_ESCALATE_MINUTES", 10),
         )
 
     @property
@@ -204,6 +208,18 @@ class Config:
                 return ("twilio", f"whatsapp:{self.user_phone}")
             return ("twilio", self.user_phone)
         return None
+
+    # ---------------------------------------------------------------- voice
+    @property
+    def voice_from(self) -> str:
+        """Number calls are placed from: TWILIO_VOICE_FROM, else the SMS sender."""
+        return self.twilio_voice_from or self.twilio_from
+
+    def has_voice(self) -> bool:
+        """True when the assistant can place phone calls to the user."""
+        return bool(
+            self.twilio_account_sid and self.twilio_auth_token and self.voice_from and self.user_phone
+        )
 
     def allowed_chat_ids(self, channel: str) -> list[str]:
         """Chat ids the assistant may message on `channel` (empty = no allowlist known)."""

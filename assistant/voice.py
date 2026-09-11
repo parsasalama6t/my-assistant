@@ -6,10 +6,13 @@ inline with the call request, so no public webhook is required.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
 import httpx2 as httpx
+
+if TYPE_CHECKING:
+    from assistant.config import Config
 
 
 class VoiceError(RuntimeError):
@@ -82,3 +85,18 @@ class TwilioVoice:
 
     def close(self) -> None:
         self._http.close()
+
+
+def build_voice(config: "Config") -> TwilioVoice:
+    """A caller for the configured account that may only ring USER_PHONE."""
+    if not config.has_voice():
+        raise ValueError(
+            "phone calls need TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, a voice number "
+            "(TWILIO_VOICE_FROM or TWILIO_FROM) and USER_PHONE"
+        )
+    return TwilioVoice(
+        config.twilio_account_sid,
+        config.twilio_auth_token,
+        config.voice_from,
+        {config.user_phone},
+    )

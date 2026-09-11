@@ -340,6 +340,17 @@ def _channel_summary(config: Config) -> list[str]:
         lines.append(f"twilio: configured, {'; '.join(senders) or 'no sender'}; to {phone}; webhook {webhook}")
     else:
         lines.append("twilio: not configured (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN)")
+    if config.has_voice():
+        lines.append(f"voice: on (from {config.voice_from}, calls {config.user_phone})")
+    else:
+        missing = []
+        if not (config.twilio_account_sid and config.twilio_auth_token):
+            missing.append("TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN")
+        if not config.voice_from:
+            missing.append("TWILIO_VOICE_FROM or TWILIO_FROM")
+        if not config.user_phone:
+            missing.append("USER_PHONE")
+        lines.append(f"voice: off (needs {', '.join(missing)})")
     return lines
 
 
@@ -354,6 +365,28 @@ def cmd_channels(args: argparse.Namespace, store: Store, config: Config) -> int:
         print(f"timezone: {config.timezone}")
         print(f"morning briefing: {config.morning_briefing or 'off'}")
         print(f"evening review: {config.evening_review or 'off'}")
+        return 0
+
+    if args.action == "test" and getattr(args, "call", False):
+        from assistant.voice import VoiceError, build_voice
+
+        if not config.has_voice():
+            print(
+                "Phone calls are not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, a voice-capable\n"
+                "number (TWILIO_VOICE_FROM or TWILIO_FROM) and USER_PHONE in .env, or run: my-assistant setup",
+                file=sys.stderr,
+            )
+            return 2
+        voice = build_voice(config)
+        text = args.text or "Hello from my-assistant. Phone calls work."
+        try:
+            call_id = voice.call(config.user_phone, text)
+        except VoiceError as exc:
+            print(f"Call failed: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            voice.close()
+        print(f"Calling {config.user_phone} from {config.voice_from} (call {call_id}).")
         return 0
 
     if args.action == "test":
@@ -412,9 +445,13 @@ def _fmt_schedule(row: dict[str, Any], config: Config) -> str:
     when = format_local(row["next_run_utc"], config.tz)
     repeat = f"  every {row['repeat']}" if row.get("repeat") else ""
     text = row["text"] or f"({row['kind']})"
+    if row.get("kind") == "call":
+        text = f"[call] {text}"
+    priority = row.get("priority") or "normal"
+    pri = f"  !{priority}" if priority != "normal" and row.get("kind") != "call" else ""
     state = "" if row.get("enabled") else "  [cancelled]"
     source = f"  <{row['source']}>" if row.get("source") else ""
-    return f"#{row['id']} {when}{repeat}  {row['channel']} {row['chat_id']}  {text}{source}{state}"
+    return f"#{row['id']} {when}{repeat}  {row['channel']} {row['chat_id']}  {text}{pri}{source}{state}"
 
 
 def _fmt_delivery(d: dict[str, Any], config: Config) -> str:
@@ -436,14 +473,19 @@ def cmd_schedule(args: argparse.Namespace, store: Store, config: Config) -> int:
             return 2
         ctx = ToolContext(store, tz=config.tz, config=config)
         out, err = run_tool(
-            ctx, "schedule_message", {"text": args.text, "when": args.at, "repeat": args.repeat}
+            ctx,
+            "schedule_message",
+            {"text": args.text, "when": args.at, "repeat": args.repeat, "priority": args.priority},
         )
         if err:
             print(out, file=sys.stderr)
             return 1
         view = json.loads(out)
         repeat = f", repeating {view['repeat']}" if view.get("repeat") else ""
-        print(f"Scheduled #{view['id']}: \"{view['text']}\" at {view['next_run']}{repeat} via {view['channel']}.")
+        priority = f" ({view['priority']})" if view.get("priority", "normal") != "normal" else ""
+        print(f"Scheduled #{view['id']}: \"{view['text']}\" at {view['next_run']}{repeat} via {view['channel']}{priority}.")
+        if view.get("note"):
+            print(view["note"])
         return 0
     if args.action == "cancel":
         row = store.get_schedule(args.id)
@@ -479,7 +521,7 @@ def cmd_schedule(args: argparse.Namespace, store: Store, config: Config) -> int:
 def cmd_demo(args: argparse.Namespace, store: Store, config: Config) -> int:
     import dataclasses
 
-    from assistant.channels.console import CHAT_ID, ConsoleChannel
+    from assistant.channels.console import CHAT_ID, ConsoleChannel, ConsoleVoice
     from assistant.daemon import Daemon
     from assistant.demo import BANNER, ScriptedClient
 
@@ -493,6 +535,7 @@ def cmd_demo(args: argparse.Namespace, store: Store, config: Config) -> int:
         telegram_chat_ids=[],
         twilio_account_sid="",
         twilio_auth_token="",
+        user_phone=config.user_phone or "your phone",  # calls are printed, never dialled
     )
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
     console = ConsoleChannel()
@@ -500,6 +543,7 @@ def cmd_demo(args: argparse.Namespace, store: Store, config: Config) -> int:
         demo_config,
         client=ScriptedClient(demo_config.tz),
         channels={"console": console},
+        voice=ConsoleVoice(prompt=console.prompt),
     )
     console.on_eof = daemon.stop
 
@@ -657,7 +701,37 @@ def cmd_setup(args: argparse.Namespace, store: Store, config: Config) -> int:
         if chat_id:
             updates["TELEGRAM_CHAT_ID"] = chat_id
 
-    print("\n4. Preferences")
+    print("\n4. Phone calls (optional)")
+    print(
+        "   With a Twilio account the assistant can call your phone for things that matter\n"
+        "   (\"call me if...\", flights, medication). A Twilio number costs about $1.15/month\n"
+        "   and calls about $0.015/minute. Sign up at https://www.twilio.com/ and buy a\n"
+        "   voice-capable number; on a trial account, verify your own number first."
+    )
+    if _yes("   Set up phone calls now?", default=bool(current.get("TWILIO_ACCOUNT_SID"))):
+        sid = _ask("TWILIO_ACCOUNT_SID", current.get("TWILIO_ACCOUNT_SID", ""))
+        auth = _ask("TWILIO_AUTH_TOKEN", current.get("TWILIO_AUTH_TOKEN", ""), secret=True)
+        voice_from = _ask(
+            "Twilio number to call from, E.164 (TWILIO_VOICE_FROM)",
+            current.get("TWILIO_VOICE_FROM") or current.get("TWILIO_FROM", ""),
+        )
+        phone = _ask("Your phone number, E.164 (USER_PHONE)", current.get("USER_PHONE", ""))
+        for env_key, value in (
+            ("TWILIO_ACCOUNT_SID", sid),
+            ("TWILIO_AUTH_TOKEN", auth),
+            ("TWILIO_VOICE_FROM", voice_from),
+            ("USER_PHONE", phone),
+        ):
+            if value:
+                updates[env_key] = value
+        if sid and auth and voice_from and phone:
+            print("   Calls are on. Try: my-assistant channels test --call")
+        else:
+            print("   Incomplete; calls stay off until all four values are set.")
+    else:
+        print("   Skipped; the assistant will text only.")
+
+    print("\n5. Preferences")
     name = _ask("Your name (ASSISTANT_USER_NAME)", current.get("ASSISTANT_USER_NAME", ""))
     if name:
         updates["ASSISTANT_USER_NAME"] = name
@@ -751,8 +825,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("channels", help="inspect and test messaging channels")
     ch = p.add_subparsers(dest="action", required=True)
     ch.add_parser("status", help="what is configured")
-    q = ch.add_parser("test", help="send yourself a test message")
+    q = ch.add_parser("test", help="send yourself a test message (or a test call)")
     q.add_argument("--text", default="")
+    q.add_argument("--call", action="store_true", help="place a test phone call instead of sending a text")
     q = ch.add_parser("whoami", help="discover your Telegram chat id")
     q.add_argument("--seconds", type=int, default=60)
     p.set_defaults(func=cmd_channels)
@@ -765,6 +840,12 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("text")
     q.add_argument("--at", required=True, help="local time, e.g. 2026-09-12T15:00")
     q.add_argument("--repeat", default=None, help="daily | weekdays | weekends | weekly | days:mon,wed")
+    q.add_argument(
+        "--priority",
+        choices=["normal", "important", "critical"],
+        default="normal",
+        help="important: text, then call if you don't reply; critical: call and text at once",
+    )
     q = sc.add_parser("cancel", help="cancel a scheduled message")
     q.add_argument("id", type=int)
     sc.add_parser("sync", help="rebuild briefing and task/event reminder rows now")

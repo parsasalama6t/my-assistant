@@ -40,6 +40,7 @@ SCHED_KEYS = (
     "TWILIO_WEBHOOK_URL", "TWILIO_WEBHOOK_PORT", "USER_PHONE", "ASSISTANT_MORNING_BRIEFING",
     "ASSISTANT_EVENING_REVIEW", "ASSISTANT_EVENT_LEAD_MINUTES", "ASSISTANT_TASK_LEAD_MINUTES",
     "ASSISTANT_CATCHUP_GRACE_MINUTES", "ASSISTANT_TICK_SECONDS", "ASSISTANT_SESSION_IDLE_HOURS",
+    "TWILIO_VOICE_FROM", "ASSISTANT_ESCALATE_MINUTES",
 )
 
 
@@ -133,3 +134,41 @@ def test_default_channel_precedence_and_targets(clean_env) -> None:
     clean_env.setenv("ASSISTANT_DEFAULT_CHANNEL", "telegram")
     clean_env.delenv("TELEGRAM_CHAT_ID")
     assert Config.from_env().default_target() is None
+
+
+def test_voice_defaults_and_has_voice(clean_env) -> None:
+    cfg = Config.from_env()
+    assert cfg.escalate_minutes == 10 and cfg.twilio_voice_from == "" and cfg.voice_from == ""
+    assert cfg.has_voice() is False
+
+    clean_env.setenv("TWILIO_ACCOUNT_SID", "AC1")
+    clean_env.setenv("TWILIO_AUTH_TOKEN", "tok")
+    clean_env.setenv("USER_PHONE", "+14165550100")
+    cfg = Config.from_env()
+    assert cfg.has_voice() is False  # WhatsApp-only: no voice-capable number
+
+    clean_env.setenv("TWILIO_FROM", "+15550001111")
+    cfg = Config.from_env()
+    assert cfg.twilio_voice_from == "+15550001111" and cfg.voice_from == "+15550001111"  # falls back to TWILIO_FROM
+    assert cfg.has_voice() is True
+
+    clean_env.setenv("TWILIO_VOICE_FROM", "+15550002222")
+    clean_env.setenv("ASSISTANT_ESCALATE_MINUTES", "3")
+    cfg = Config.from_env()
+    assert cfg.voice_from == "+15550002222" and cfg.escalate_minutes == 3
+
+    clean_env.delenv("TWILIO_AUTH_TOKEN")
+    assert Config.from_env().has_voice() is False
+    clean_env.setenv("TWILIO_AUTH_TOKEN", "tok")
+    clean_env.delenv("USER_PHONE")
+    assert Config.from_env().has_voice() is False
+
+    clean_env.setenv("ASSISTANT_ESCALATE_MINUTES", "soon")
+    with pytest.raises(ValueError, match="ASSISTANT_ESCALATE_MINUTES"):
+        Config.from_env()
+
+
+def test_has_voice_on_dataclass() -> None:
+    assert Config(twilio_account_sid="AC1", twilio_auth_token="t", twilio_voice_from="+1", user_phone="+2").has_voice()
+    assert Config(twilio_account_sid="AC1", twilio_auth_token="t", twilio_from="+1", user_phone="+2").has_voice()
+    assert not Config(twilio_account_sid="AC1", twilio_auth_token="t", twilio_from="+1").has_voice()

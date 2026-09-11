@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE TABLE IF NOT EXISTS scheduled_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL,            -- custom | briefing | review | task_reminder | event_reminder
+    kind TEXT NOT NULL,            -- custom | briefing | review | task_reminder | event_reminder | call
     text TEXT NOT NULL DEFAULT '',
     channel TEXT NOT NULL,
     chat_id TEXT NOT NULL,
@@ -67,10 +67,11 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
     repeat TEXT,                   -- NULL | daily | weekdays | weekends | weekly | days:mon,wed
     local_time TEXT,               -- HH:MM for recurring rows
     tz TEXT NOT NULL,
-    source TEXT,                   -- NULL for user rows; system:morning | system:evening | task:<id> | event:<id> | gcal:<id>
+    source TEXT,                   -- NULL for user rows; system:morning | system:evening | task:<id> | event:<id> | gcal:<id> | escalate:<id>:<fire>
     enabled INTEGER NOT NULL DEFAULT 1,
     last_sent_utc TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'normal'  -- normal | important | critical
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sched_source ON scheduled_messages(source) WHERE source IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sched_due ON scheduled_messages(enabled, next_run_utc);
@@ -104,10 +105,18 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
 
 PRIORITIES = ("low", "normal", "high")
 TASK_STATUSES = ("open", "done")
-SCHEDULE_KINDS = ("custom", "briefing", "review", "task_reminder", "event_reminder")
+SCHEDULE_KINDS = ("custom", "briefing", "review", "task_reminder", "event_reminder", "call")
+SCHEDULE_PRIORITIES = ("normal", "important", "critical")
 DELIVERY_STATUSES = ("sending", "sent", "failed", "skipped")
 AUTO_SOURCE_PREFIXES = ("task:", "event:", "gcal:")
+ESCALATION_PREFIX = "escalate:"
 MAX_SCHEDULE_TEXT = 1000
+
+# Columns added after the first release; `CREATE TABLE IF NOT EXISTS` does not
+# touch an existing table, so they are added with ALTER TABLE on open.
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("scheduled_messages", "priority", "TEXT NOT NULL DEFAULT 'normal'"),
+)
 
 
 def now_iso() -> str:
@@ -129,6 +138,15 @@ class Store:
             # WAL lets the daemon and an interactive chat share the file safely.
             self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns that older databases are missing."""
+        for table, column, decl in MIGRATIONS:
+            existing = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -376,9 +394,17 @@ class Store:
 
     # ------------------------------------------------------------- schedules
     @staticmethod
-    def _check_schedule_fields(kind: str | None, text: str | None, channel: str | None, chat_id: str | None) -> None:
+    def _check_schedule_fields(
+        kind: str | None,
+        text: str | None,
+        channel: str | None,
+        chat_id: str | None,
+        priority: str | None = None,
+    ) -> None:
         if kind is not None and kind not in SCHEDULE_KINDS:
             raise ValueError(f"kind must be one of {SCHEDULE_KINDS}")
+        if priority is not None and priority not in SCHEDULE_PRIORITIES:
+            raise ValueError(f"priority must be one of {SCHEDULE_PRIORITIES}")
         if text is not None and len(text) > MAX_SCHEDULE_TEXT:
             raise ValueError(f"text is too long (max {MAX_SCHEDULE_TEXT} characters)")
         if channel is not None and not channel.strip():
@@ -397,17 +423,19 @@ class Store:
         repeat: str | None = None,
         local_time: str | None = None,
         source: str | None = None,
+        priority: str = "normal",
     ) -> dict[str, Any]:
-        self._check_schedule_fields(kind, text, channel, chat_id)
+        priority = priority or "normal"
+        self._check_schedule_fields(kind, text, channel, chat_id, priority)
         if not next_run_utc:
             raise ValueError("next_run_utc is required")
         if not tz:
             raise ValueError("tz is required")
         cur = self.conn.execute(
             "INSERT INTO scheduled_messages"
-            " (kind, text, channel, chat_id, next_run_utc, repeat, local_time, tz, source, enabled, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
-            (kind, text or "", channel, str(chat_id), next_run_utc, repeat, local_time, tz, source, now_iso()),
+            " (kind, text, channel, chat_id, next_run_utc, repeat, local_time, tz, source, enabled, created_at, priority)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (kind, text or "", channel, str(chat_id), next_run_utc, repeat, local_time, tz, source, now_iso(), priority),
         )
         self.conn.commit()
         return self.get_schedule(cur.lastrowid)  # type: ignore[return-value]
@@ -416,28 +444,30 @@ class Store:
         """Insert or update the single row identified by `source`.
 
         Required on insert: kind, channel, chat_id, next_run_utc, tz. On conflict
-        text/next_run_utc/local_time/repeat/channel/chat_id/enabled are updated.
+        text/next_run_utc/local_time/repeat/channel/chat_id/enabled/priority are updated.
         """
         if not source:
             raise ValueError("source is required")
-        allowed = {"kind", "text", "channel", "chat_id", "next_run_utc", "repeat", "local_time", "tz", "enabled"}
+        allowed = {"kind", "text", "channel", "chat_id", "next_run_utc", "repeat", "local_time", "tz", "enabled", "priority"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"unknown schedule field(s): {', '.join(sorted(unknown))}")
         for required in ("kind", "channel", "chat_id", "next_run_utc", "tz"):
             if not fields.get(required):
                 raise ValueError(f"{required} is required")
-        self._check_schedule_fields(fields["kind"], fields.get("text"), fields["channel"], fields["chat_id"])
+        priority = fields.get("priority") or "normal"
+        self._check_schedule_fields(fields["kind"], fields.get("text"), fields["channel"], fields["chat_id"], priority)
         text = fields.get("text") or ""
         enabled = 1 if fields.get("enabled", True) else 0
         self.conn.execute(
             "INSERT INTO scheduled_messages"
-            " (kind, text, channel, chat_id, next_run_utc, repeat, local_time, tz, source, enabled, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " (kind, text, channel, chat_id, next_run_utc, repeat, local_time, tz, source, enabled, created_at, priority)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(source) WHERE source IS NOT NULL DO UPDATE SET"
             " text = excluded.text, next_run_utc = excluded.next_run_utc,"
             " local_time = excluded.local_time, repeat = excluded.repeat,"
-            " channel = excluded.channel, chat_id = excluded.chat_id, enabled = excluded.enabled",
+            " channel = excluded.channel, chat_id = excluded.chat_id, enabled = excluded.enabled,"
+            " priority = excluded.priority",
             (
                 fields["kind"],
                 text,
@@ -450,6 +480,7 @@ class Store:
                 source,
                 enabled,
                 now_iso(),
+                priority,
             ),
         )
         self.conn.commit()
@@ -493,6 +524,27 @@ class Store:
         )
         self.conn.commit()
         return cur.rowcount > 0
+
+    def cancel_schedules_by_source_prefix(self, prefix: str) -> int:
+        """Disable every enabled row whose source starts with `prefix`; returns how many."""
+        if not prefix:
+            raise ValueError("prefix is required")
+        cur = self.conn.execute(
+            "UPDATE scheduled_messages SET enabled = 0 WHERE enabled = 1 AND source LIKE ?",
+            (f"{prefix}%",),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def cancel_escalations(self, channel: str, chat_id: str) -> int:
+        """Disable pending escalation calls that were created for texts sent to this chat."""
+        cur = self.conn.execute(
+            "UPDATE scheduled_messages SET enabled = 0"
+            " WHERE enabled = 1 AND source LIKE ? AND channel = ? AND chat_id = ?",
+            (f"{ESCALATION_PREFIX}%", channel, str(chat_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     def delete_schedule(self, schedule_id: int) -> bool:
         cur = self.conn.execute("DELETE FROM scheduled_messages WHERE id = ?", (schedule_id,))

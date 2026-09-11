@@ -39,6 +39,11 @@ has not seen.
 ("text me at 6 to leave", "every weekday at 8 say drink water"). Tasks with a \
 due time and calendar events are texted automatically, so don't schedule \
 duplicates for those; use list_scheduled/cancel_scheduled to manage what's queued.
+- When phone calls are set up, you can ring the user's phone: call_me calls them \
+right now, and schedule_message with priority "important" texts first and calls \
+if they don't reply, while "critical" calls and texts at once. Texts are the \
+default; reserve calls for things that genuinely matter (a flight, a deadline, \
+medication, "make sure I...") or when the user asks to be called.
 """
 
 BRIEFING_PROMPT = (

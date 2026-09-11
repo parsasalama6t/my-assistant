@@ -70,6 +70,50 @@ def test_channels_status(env: Path, capsys) -> None:
     assert "default target: telegram 111" in out
     assert "timezone: America/Toronto" in out
     assert "morning briefing: 07:30" in out and "evening review: 21:00" in out
+    assert "voice: off" in out and "USER_PHONE" in out
+
+
+def test_channels_status_and_test_call_with_voice(env: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    code, out, err = run(["channels", "test", "--call"], capsys)
+    assert code == 2 and "not configured" in err
+
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "AC1")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("TWILIO_VOICE_FROM", "+15550001111")
+    monkeypatch.setenv("USER_PHONE", "+14165550100")
+    code, out, _ = run(["channels", "status"], capsys)
+    assert code == 0 and "voice: on (from +15550001111, calls +14165550100)" in out
+
+    placed: list[tuple[str, str]] = []
+
+    class StubVoice:
+        def call(self, to_number: str, text: str, repeat: int = 2) -> str:
+            placed.append((to_number, text))
+            return "CA77"
+
+        def close(self) -> None:
+            pass
+
+    import assistant.voice as voice_module
+
+    monkeypatch.setattr(voice_module, "build_voice", lambda config: StubVoice())
+    code, out, err = run(["channels", "test", "--call", "--text", "Testing one two"], capsys)
+    assert code == 0, err
+    assert placed == [("+14165550100", "Testing one two")] and "CA77" in out
+
+
+def test_schedule_add_with_priority(env: Path, capsys) -> None:
+    code, out, err = run(["schedule", "add", "Take meds", "--at", "2099-09-12T15:00", "--priority", "important"], capsys)
+    assert code == 0, err
+    assert "(important)" in out and "text only" in out  # voice is off in this env
+    store = Store(env / "assistant.db")
+    row = store.list_schedules()[0]
+    store.close()
+    assert row["priority"] == "important"
+    code, out, _ = run(["schedule", "list"], capsys)
+    assert "!important" in out
+    with pytest.raises(SystemExit):
+        cli.main(["schedule", "add", "x", "--at", "2099-09-12T15:00", "--priority", "loud"])
 
 
 def test_daemon_refuses_without_channels(env: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:

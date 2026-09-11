@@ -70,3 +70,32 @@ class FakeGoogleCalendar:
     def list_events(self, start=None, end=None, limit=25):
         self.calls.append((start, end, limit))
         return list(self.events)
+
+
+class FakeCaller:
+    """Records phone calls the scheduler/daemon place; can be told to fail."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.fail_with: Exception | None = None
+
+    def __call__(self, to_number: str, text: str) -> str:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.calls.append((to_number, text))
+        return f"CA{len(self.calls)}"
+
+
+class FakeVoice:
+    """Stands in for TwilioVoice inside the daemon (`voice=` injection)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.closed = False
+
+    def call(self, to_number: str, text: str, repeat: int = 2) -> str:
+        self.calls.append((to_number, text))
+        return f"CA{len(self.calls)}"
+
+    def close(self) -> None:
+        self.closed = True

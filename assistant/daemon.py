@@ -6,6 +6,11 @@ Threads:
   * the scheduler loop,
   * a single worker that handles inbound messages one at a time.
 
+When phone calls are configured (`Config.has_voice`), `place_call` rings the
+user's phone; the scheduler uses it for important/critical rows and the
+`call_me` tool uses it directly. Any inbound message from the user cancels
+escalation calls that were pending for that chat.
+
 Each thread opens its own SQLite connection through `store_factory` (the
 database is in WAL mode), and every model turn runs under `turn_lock`.
 """
@@ -27,6 +32,7 @@ from assistant.prompts import BRIEFING_PROMPT, EVENING_REVIEW_PROMPT
 from assistant.schedule_rules import format_local
 from assistant.scheduler import Scheduler, TickReport
 from assistant.store import Store
+from assistant.voice import VoiceError, build_voice
 
 DEFAULT_WEBHOOK_PATH = "/webhooks/twilio"
 POLL_TIMEOUT = 25
@@ -52,12 +58,16 @@ class Daemon:
         google: Any | None = None,
         channels: dict[str, Channel] | None = None,
         log: logging.Logger | None = None,
+        voice: Any | None = None,
     ) -> None:
         self.config = config
         self.store_factory = store_factory or (lambda: Store(config.db_path))
         self.client = client
         self.google = google
         self.log = log or logging.getLogger("assistant.daemon")
+        if voice is None and config.has_voice():
+            voice = build_voice(config)
+        self.voice = voice
         self.stop_event = threading.Event()
         self.turn_lock = threading.Lock()
         self.queue: "queue.Queue[InboundMessage]" = queue.Queue()
@@ -104,6 +114,23 @@ class Daemon:
             raise ChannelError(f"no channel named {channel!r} is configured")
         return ch.send(chat_id, text)
 
+    # -------------------------------------------------------------- voice
+    @property
+    def voice_enabled(self) -> bool:
+        return self.voice is not None
+
+    def place_call(self, to_number: str, text: str) -> str:
+        """Ring `to_number` and read `text` aloud; returns the provider's call id."""
+        if self.voice is None:
+            raise VoiceError("voice not configured")
+        call_id = self.voice.call(to_number, text)
+        self.log.info("placed call to %s (%s)", to_number, call_id)
+        return str(call_id)
+
+    @property
+    def _caller(self) -> Callable[[str, str], str] | None:
+        return self.place_call if self.voice is not None else None
+
     def _reply(self, channel: str, chat_id: str, text: str) -> None:
         ch = self.channels.get(channel)
         limit = ch.max_len if ch is not None else 4096
@@ -123,6 +150,7 @@ class Daemon:
                 google=self.google,
                 channel=channel,
                 chat_id=chat_id,
+                place_call=self._caller,
             )
             result = assistant.chat(prompt)
         return result.text or result.refusal or ""
@@ -138,6 +166,10 @@ class Daemon:
             when = format_local(r["next_run_utc"], self.config.tz)
             repeat = f" ({r['repeat']})" if r.get("repeat") else ""
             text = r["text"] or r["kind"]
+            if r.get("kind") == "call":
+                text = f"call: {text}"
+            elif (r.get("priority") or "normal") != "normal":
+                text = f"{text} [{r['priority']}]"
             lines.append(f"#{r['id']} {when}{repeat}: {text}")
         return "Scheduled:\n" + "\n".join(lines)
 
@@ -190,6 +222,11 @@ class Daemon:
         text = (msg.text or "").strip()
         if not text:
             return None
+        if allowed:
+            # The user is responding, so any "call if no reply" follow-ups are moot.
+            cancelled = store.cancel_escalations(msg.channel, msg.chat_id)
+            if cancelled:
+                self.log.info("cancelled %d pending escalation call(s) for %s %s", cancelled, msg.channel, msg.chat_id)
 
         if text.startswith("/"):
             cmd = text.split()[0].lower().split("@", 1)[0]
@@ -217,6 +254,7 @@ class Daemon:
                     google=self.google,
                     channel=msg.channel,
                     chat_id=msg.chat_id,
+                    place_call=self._caller,
                 )
                 result = assistant.chat(text)
             reply = result.text or result.refusal or "(no reply)"
@@ -290,6 +328,7 @@ class Daemon:
             render_briefing=self.render_briefing,
             google=self.google,
             log=self.log.getChild("scheduler"),
+            place_call=self._caller,
         )
         scheduler.run_forever(self.stop_event)
 
@@ -347,6 +386,7 @@ class Daemon:
             render_briefing=self.render_briefing,
             google=self.google,
             log=self.log.getChild("scheduler"),
+            place_call=self._caller,
         )
         scheduler.ensure_fixed_schedules()
         return scheduler.run_once()
@@ -358,6 +398,12 @@ class Daemon:
                 channel.close()
             except Exception:  # noqa: BLE001
                 pass
+        close = getattr(self.voice, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001
+                pass
         self._close_stores()
 
     def run(self) -> int:
@@ -365,13 +411,19 @@ class Daemon:
         if not self.channels:
             raise ChannelError("no messaging channel is configured")
         self._install_signal_handlers()
+        # Create/migrate the database and switch it to WAL before the threads
+        # open their own connections, so they never race on a fresh file.
+        self._store()
         for channel in self.channels.values():
             if type(channel).poll is not Channel.poll:
                 self._spawn(f"poll-{channel.name}", lambda ch=channel: self._poll_loop(ch))
         self._start_webhook()
         self._spawn("scheduler", self._scheduler_loop)
         self._spawn("worker", self._worker_loop)
-        self.log.info("daemon started (channels: %s)", ", ".join(sorted(self.channels)))
+        self.log.info(
+            "daemon started (channels: %s; voice: %s)",
+            ", ".join(sorted(self.channels)), "on" if self.voice_enabled else "off",
+        )
         try:
             while not self.stop_event.wait(1.0):
                 pass
