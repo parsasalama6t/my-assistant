@@ -35,7 +35,28 @@ not connected.
 - Email is outward-facing. Draft by default; send only when the user has clearly \
 asked you to send and has seen what will go out. Never send anything the user \
 has not seen.
+- When messaging is set up, schedule_message texts the user at a chosen time \
+("text me at 6 to leave", "every weekday at 8 say drink water"). Tasks with a \
+due time and calendar events are texted automatically, so don't schedule \
+duplicates for those; use list_scheduled/cancel_scheduled to manage what's queued.
 """
+
+BRIEFING_PROMPT = (
+    "Give me my briefing for today. Check the current date, then list today's and "
+    "tomorrow's events, overdue and due-soon tasks, and, if Gmail is connected, unread "
+    "emails from the last two days that look like they need a reply or action. Add "
+    "anything from what you remember about me that's relevant today. Be concise; if a "
+    "section is empty, skip it."
+)
+
+EVENING_REVIEW_PROMPT = (
+    "Give me my evening review. Check the current date, then cover: what got done today, "
+    "what's still open (overdue or due soon), what's first on tomorrow's calendar, and "
+    "finish with one short question to help me plan the evening. Be concise and "
+    "phone-friendly: plain text, short lines, no headers; skip empty sections."
+)
+
+CHANNEL_LABELS = {"telegram": "Telegram", "whatsapp": "WhatsApp", "sms": "SMS", "twilio": "SMS"}
 
 
 def build_system(
@@ -43,16 +64,26 @@ def build_system(
     memories: list[dict[str, Any]],
     now: datetime | None = None,
     google_email: str | None = None,
+    channel: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return the system prompt as content blocks.
 
     The first block is stable and cached; the second carries the parts that
-    change between turns (date, memories, user name).
+    change between turns (date, memories, user name, chat channel).
     """
     now = now or datetime.now().astimezone()
+    tz_label = getattr(now.tzinfo, "key", None) or now.tzname() or ""
     dynamic: list[str] = [
-        f"Current date and time: {now.replace(microsecond=0).isoformat()} ({now.strftime('%A')})."
+        f"Current date and time: {now.replace(microsecond=0).isoformat()} ({now.strftime('%A')}"
+        + (f", {tz_label}" if tz_label else "")
+        + ")."
     ]
+    if channel:
+        label = CHANNEL_LABELS.get(channel.lower(), channel)
+        dynamic.append(
+            f"You are replying over {label}; the user reads this on their phone. Keep replies "
+            "short and plain text: no markdown headers, tables, or code blocks."
+        )
     if user_name:
         dynamic.append(f"The user's name is {user_name}.")
     if google_email is not None:

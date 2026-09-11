@@ -138,3 +138,51 @@ def test_missing_credentials_become_assistant_error(store: Store, config: Config
 
     with pytest.raises(AssistantError, match="ANTHROPIC_API_KEY"):
         Assistant(store, config, client=NoAuthClient()).chat("hi")
+
+
+def test_system_prompt_mentions_timezone_and_channel(store: Store) -> None:
+    config = Config(user_name="Sam", timezone="America/Toronto", fallbacks=False)
+    client = FakeClient([make_message([text("ok")])])
+    Assistant(store, config, client=client, channel="telegram", chat_id="42").chat("hi")
+    system_text = client.calls[0]["system"][1]["text"]
+    assert "America/Toronto" in system_text
+    assert "replying over Telegram" in system_text and "plain text" in system_text
+    assert "schedule_message" in client.calls[0]["system"][0]["text"]
+
+
+def test_no_channel_line_for_cli(store: Store, config: Config) -> None:
+    client = FakeClient([make_message([text("ok")])])
+    Assistant(store, config, client=client).chat("hi")
+    assert "replying over" not in client.calls[0]["system"][1]["text"]
+
+
+def test_build_system_channel_labels() -> None:
+    assert "WhatsApp" in build_system("", [], channel="whatsapp")[1]["text"]
+    assert "SMS" in build_system("", [], channel="sms")[1]["text"]
+    assert "replying over" not in build_system("", [])[1]["text"]
+
+
+def test_scheduling_tools_follow_messaging_config(store: Store) -> None:
+    client = FakeClient([make_message([text("ok")])])
+    Assistant(store, Config(fallbacks=False), client=client).chat("hi")
+    assert "schedule_message" not in {t["name"] for t in client.calls[0]["tools"]}
+
+    messaging = Config(fallbacks=False, default_channel="telegram", telegram_bot_token="t", telegram_chat_ids=["42"])
+    client = FakeClient(
+        [
+            make_message(
+                [tool_use("schedule_message", {"text": "Go to bed", "when": "2999-01-01T22:00"})],
+                stop_reason="tool_use",
+            ),
+            make_message([text("Scheduled.")]),
+        ]
+    )
+    a = Assistant(store, messaging, client=client, channel="telegram", chat_id="42")
+    result = a.chat("text me at 10pm to go to bed")
+    assert "schedule_message" in {t["name"] for t in client.calls[0]["tools"]}
+    assert result.tool_calls[0]["error"] is False, result.tool_calls[0]["output"]
+    row = store.list_schedules()[0]
+    assert row["text"] == "Go to bed" and row["chat_id"] == "42" and row["tz"] == "America/Toronto"
+    assert row["next_run_utc"] == "2999-01-02T03:00:00+00:00"  # 22:00 EST
+    # The chat session is separate from the CLI's latest session.
+    assert a.session_id != store.session_for_chat("telegram", "42", 3600)

@@ -8,19 +8,38 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Callable
+from datetime import datetime, timedelta, timezone, tzinfo
+from typing import TYPE_CHECKING, Any, Callable
 
 from assistant.google_client import GoogleClient, GoogleNotConnected
-from assistant.store import Store
+from assistant.schedule_rules import (
+    REPEAT_RULES,
+    format_local,
+    next_occurrence,
+    parse_local_datetime,
+    parse_repeat,
+    to_utc_iso,
+)
+from assistant.store import AUTO_SOURCE_PREFIXES, Store
+
+if TYPE_CHECKING:
+    from assistant.config import Config
 
 
 @dataclass
 class ToolContext:
-    """Everything a tool handler may need."""
+    """Everything a tool handler may need.
+
+    `channel`/`chat_id` identify the chat a request came from (None for the CLI
+    or web UI); `config` supplies the default messaging target and allowlists.
+    """
 
     store: Store
     google: GoogleClient | None = None
+    tz: tzinfo = timezone.utc
+    channel: str | None = None
+    chat_id: str | None = None
+    config: "Config | None" = None
 
 
 Handler = Callable[["ToolContext", dict[str, Any]], Any]
@@ -53,16 +72,21 @@ def _obj(properties: dict[str, Any], required: list[str] | None = None) -> dict[
 
 
 DATETIME_HINT = "ISO 8601 (e.g. 2026-09-14 or 2026-09-14T15:30)."
+_ONE_MINUTE = timedelta(minutes=1)
 
 
 # ----------------------------------------------------------------- handlers
+def _tz_name(tz: tzinfo, at: datetime | None = None) -> str:
+    return getattr(tz, "key", None) or (at or datetime.now(tz)).tzname() or str(tz)
+
+
 def _now(ctx: ToolContext, args: dict[str, Any]) -> str:
-    local = datetime.now().astimezone()
+    local = datetime.now(ctx.tz)
     return _dump(
         {
             "datetime": local.replace(microsecond=0).isoformat(),
             "weekday": local.strftime("%A"),
-            "timezone": local.tzname(),
+            "timezone": _tz_name(ctx.tz, local),
         }
     )
 
@@ -484,7 +508,135 @@ GOOGLE_TOOLS: list[Tool] = [
 ]
 
 GOOGLE_TOOL_NAMES = {t.name for t in GOOGLE_TOOLS}
-TOOLS_BY_NAME: dict[str, Tool] = {t.name: t for t in [*TOOLS, *GOOGLE_TOOLS]}
+
+
+# ---------------------------------------------------------- schedule tools
+def _target(ctx: ToolContext) -> tuple[str, str]:
+    """Resolve where a scheduled text goes: the current chat, else the configured default."""
+    if ctx.channel and ctx.chat_id:
+        target = (ctx.channel, str(ctx.chat_id))
+    elif ctx.config is not None and ctx.config.default_target() is not None:
+        target = ctx.config.default_target()  # type: ignore[assignment]
+    else:
+        raise ValueError(
+            "No messaging channel is configured, so scheduled texts cannot be delivered. "
+            "Set TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID or the TWILIO_* variables and USER_PHONE."
+        )
+    if ctx.config is not None:
+        allowed = ctx.config.allowed_chat_ids(target[0])
+        if allowed and target[1] not in allowed:
+            raise ValueError(f"{target[1]} is not an allowed recipient on {target[0]}")
+    return target
+
+
+def _schedule_view(row: dict[str, Any], tz: tzinfo) -> dict[str, Any]:
+    out = {
+        "id": row["id"],
+        "kind": row["kind"],
+        "text": row["text"],
+        "next_run": format_local(row["next_run_utc"], tz),
+        "repeat": row["repeat"],
+        "channel": row["channel"],
+    }
+    if row.get("source"):
+        out["source"] = row["source"]
+    return out
+
+
+def _schedule_message(ctx: ToolContext, args: dict[str, Any]) -> str:
+    text = (args.get("text") or "").strip()
+    if not text:
+        raise ValueError("text cannot be empty")
+    channel, chat_id = _target(ctx)
+    first = parse_local_datetime(args.get("when") or "", ctx.tz)
+    now = datetime.now(timezone.utc)
+    rule = parse_repeat(args.get("repeat"), weekday=first.astimezone(ctx.tz).weekday())
+    local_time: str | None = None
+    if rule:
+        local_time = first.astimezone(ctx.tz).strftime("%H:%M")
+        if first <= now:
+            first = next_occurrence(rule, local_time, now, ctx.tz)
+        else:
+            first = next_occurrence(rule, local_time, first - _ONE_MINUTE, ctx.tz)
+    elif first <= now:
+        raise ValueError(
+            f"{args.get('when')} is in the past (now is {now.astimezone(ctx.tz).strftime('%Y-%m-%d %H:%M')})"
+        )
+    row = ctx.store.add_schedule(
+        kind="custom",
+        channel=channel,
+        chat_id=chat_id,
+        next_run_utc=to_utc_iso(first),
+        tz=_tz_name(ctx.tz),
+        text=text,
+        repeat=rule,
+        local_time=local_time,
+    )
+    return _dump(_schedule_view(row, ctx.tz))
+
+
+def _list_scheduled(ctx: ToolContext, args: dict[str, Any]) -> str:
+    rows = ctx.store.list_schedules(enabled_only=True, include_system=False)
+    views = [_schedule_view(r, ctx.tz) for r in rows]
+    return _dump({"count": len(views), "timezone": _tz_name(ctx.tz), "scheduled": views})
+
+
+def _cancel_scheduled(ctx: ToolContext, args: dict[str, Any]) -> str:
+    schedule_id = int(args["id"])
+    row = ctx.store.get_schedule(schedule_id)
+    if row is None or not row["enabled"]:
+        raise ValueError(f"no active scheduled message with id {schedule_id}")
+    source = row.get("source") or ""
+    if source.startswith(AUTO_SOURCE_PREFIXES):
+        raise ValueError(
+            "That reminder is generated automatically from a task or calendar event. "
+            "Mark the task done, change its due time, or delete the event instead."
+        )
+    ctx.store.cancel_schedule(schedule_id)
+    return _dump({"cancelled": schedule_id, "text": row["text"], "kind": row["kind"]})
+
+
+SCHEDULE_TOOLS: list[Tool] = [
+    Tool(
+        "schedule_message",
+        "Schedule a text message to the user's phone at a local date/time, once or on a "
+        "repeat. Call get_current_datetime first so 'when' is right. Messages are phone "
+        "texts: keep the text short and self-contained (it is sent verbatim, with no "
+        "other context). Tasks with due times and calendar events are texted "
+        "automatically, so do not schedule duplicates for those.\n" + REPEAT_RULES,
+        _obj(
+            {
+                "text": {"type": "string", "description": "The message to send, verbatim."},
+                "when": {
+                    "type": "string",
+                    "description": f"Local date/time of the (first) send, {DATETIME_HINT}",
+                },
+                "repeat": {
+                    "type": "string",
+                    "description": "Optional: daily | weekdays | weekends | weekly | days:mon,wed",
+                },
+            },
+            ["text", "when"],
+        ),
+        _schedule_message,
+    ),
+    Tool(
+        "list_scheduled",
+        "List scheduled messages (the user's own plus the daily briefing/review) with "
+        "their ids and next send time in the user's timezone.",
+        _obj({}),
+        _list_scheduled,
+    ),
+    Tool(
+        "cancel_scheduled",
+        "Cancel a scheduled message by id (from list_scheduled). Automatic task/event "
+        "reminders cannot be cancelled here; change the task or event instead.",
+        _obj({"id": {"type": "integer"}}, ["id"]),
+        _cancel_scheduled,
+    ),
+]
+
+TOOLS_BY_NAME: dict[str, Tool] = {t.name: t for t in [*TOOLS, *GOOGLE_TOOLS, *SCHEDULE_TOOLS]}
 
 WEB_SEARCH_TOOL: dict[str, Any] = {
     "type": "web_search_20260209",
@@ -493,11 +645,15 @@ WEB_SEARCH_TOOL: dict[str, Any] = {
 }
 
 
-def tool_definitions(web_search: bool = False, google: bool = False) -> list[dict[str, Any]]:
+def tool_definitions(
+    web_search: bool = False, google: bool = False, scheduling: bool = False
+) -> list[dict[str, Any]]:
     """Tool list to send with each request. Order is stable so prompt caching works."""
     defs = [t.definition() for t in TOOLS]
     if google:
         defs.extend(t.definition() for t in GOOGLE_TOOLS)
+    if scheduling:
+        defs.extend(t.definition() for t in SCHEDULE_TOOLS)
     if web_search:
         defs.append(WEB_SEARCH_TOOL)
     return defs

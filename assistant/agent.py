@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable
 
 import anthropic
@@ -55,12 +56,23 @@ class Assistant:
         client: Any | None = None,
         session_id: str | None = None,
         google: Any | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
     ) -> None:
         self.store = store
         self.config = config
         self.client = client or anthropic.Anthropic()
         self.google = google
-        self.tools = ToolContext(store=store, google=google)
+        self.channel = channel
+        self.chat_id = chat_id
+        self.tools = ToolContext(
+            store=store,
+            google=google,
+            tz=config.tz,
+            channel=channel,
+            chat_id=chat_id,
+            config=config,
+        )
         self.session_id = session_id or store.latest_session() or store.create_session()
 
     # ------------------------------------------------------------ sessions
@@ -82,10 +94,14 @@ class Assistant:
             system=build_system(
                 self.config.user_name,
                 self.store.list_memories(),
+                now=datetime.now(self.config.tz),
                 google_email=getattr(self.google, "email", None) if self.google else None,
+                channel=self.channel,
             ),
             tools=tool_definitions(
-                web_search=self.config.web_search, google=self.google is not None
+                web_search=self.config.web_search,
+                google=self.google is not None,
+                scheduling=self.config.has_messaging(),
             ),
             thinking={"type": "adaptive"},
             output_config={"effort": self.config.effort},

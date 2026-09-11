@@ -10,6 +10,7 @@ from assistant import __version__
 from assistant.agent import Assistant, AssistantError
 from assistant.config import Config
 from assistant.google_client import GoogleClient, GoogleNotConnected
+from assistant.prompts import BRIEFING_PROMPT
 from assistant.store import Store
 
 BOLD = "\033[1m"
@@ -18,14 +19,6 @@ CYAN = "\033[36m"
 GREEN = "\033[32m"
 RED = "\033[31m"
 RESET = "\033[0m"
-
-BRIEFING_PROMPT = (
-    "Give me my briefing for today. Check the current date, then list today's and "
-    "tomorrow's events, overdue and due-soon tasks, and, if Gmail is connected, unread "
-    "emails from the last two days that look like they need a reply or action. Add "
-    "anything from what you remember about me that's relevant today. Be concise; if a "
-    "section is empty, skip it."
-)
 
 HELP_TEXT = f"""{BOLD}Commands{RESET}
   /new        start a fresh conversation

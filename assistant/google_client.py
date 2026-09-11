@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import base64
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 from email.message import EmailMessage
 from email.utils import parseaddr
 from pathlib import Path
@@ -33,22 +33,23 @@ class GoogleNotConnected(RuntimeError):
     """Raised when a Google tool is used before `my-assistant google login`."""
 
 
-def _local_tz():
-    return datetime.now().astimezone().tzinfo
+def _local_tz(tz: tzinfo | None = None) -> tzinfo:
+    """The configured zone, or the OS-local zone when none was given."""
+    return tz or datetime.now().astimezone().tzinfo  # type: ignore[return-value]
 
 
-def _to_rfc3339(value: str) -> str:
-    """Accept 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM[:SS]' (local time) or a full RFC 3339 string."""
+def _to_rfc3339(value: str, tz: tzinfo | None = None) -> str:
+    """Accept 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM[:SS]' (wall time in `tz`) or a full RFC 3339 string."""
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_local_tz())
+        dt = dt.replace(tzinfo=_local_tz(tz))
     return dt.isoformat()
 
 
-def _event_time(value: str) -> dict[str, str]:
+def _event_time(value: str, tz: tzinfo | None = None) -> dict[str, str]:
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         return {"date": value}
-    return {"dateTime": _to_rfc3339(value)}
+    return {"dateTime": _to_rfc3339(value, tz)}
 
 
 def _header(headers: list[dict[str, str]], name: str) -> str:
@@ -92,10 +93,13 @@ def _extract_text(payload: dict[str, Any]) -> str:
 class GoogleClient:
     """Small, testable facade over the Calendar v3 and Gmail v1 APIs."""
 
-    def __init__(self, calendar_service: Any, gmail_service: Any, email: str = "") -> None:
+    def __init__(
+        self, calendar_service: Any, gmail_service: Any, email: str = "", tz: tzinfo | None = None
+    ) -> None:
         self._calendar = calendar_service
         self._gmail = gmail_service
         self.email = email
+        self.tz = tz  # None -> interpret naive times in the OS-local zone
 
     # ------------------------------------------------------------- auth
     @staticmethod
@@ -107,7 +111,7 @@ class GoogleClient:
         return GoogleClient.token_path(data_dir).is_file()
 
     @classmethod
-    def login(cls, data_dir: Path, credentials_path: Path) -> "GoogleClient":
+    def login(cls, data_dir: Path, credentials_path: Path, tz: tzinfo | None = None) -> "GoogleClient":
         """Run the browser OAuth flow and store the token."""
         try:
             from google_auth_oauthlib.flow import InstalledAppFlow
@@ -124,10 +128,10 @@ class GoogleClient:
         token = cls.token_path(data_dir)
         token.write_text(creds.to_json(), encoding="utf-8")
         token.chmod(0o600)
-        return cls.from_credentials(creds)
+        return cls.from_credentials(creds, tz=tz)
 
     @classmethod
-    def load(cls, data_dir: Path) -> "GoogleClient":
+    def load(cls, data_dir: Path, tz: tzinfo | None = None) -> "GoogleClient":
         """Load the stored token, refreshing it if needed."""
         try:
             from google.auth.transport.requests import Request
@@ -144,15 +148,15 @@ class GoogleClient:
                 token.write_text(creds.to_json(), encoding="utf-8")
             else:
                 raise GoogleNotConnected("Google token is invalid. Run: my-assistant google login")
-        return cls.from_credentials(creds)
+        return cls.from_credentials(creds, tz=tz)
 
     @classmethod
-    def from_credentials(cls, creds: Any) -> "GoogleClient":
+    def from_credentials(cls, creds: Any, tz: tzinfo | None = None) -> "GoogleClient":
         from googleapiclient.discovery import build
 
         calendar = build("calendar", "v3", credentials=creds, cache_discovery=False)
         gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        client = cls(calendar, gmail)
+        client = cls(calendar, gmail, tz=tz)
         try:
             client.email = gmail.users().getProfile(userId="me").execute().get("emailAddress", "")
         except Exception:  # noqa: BLE001 - profile lookup is best-effort
@@ -163,9 +167,9 @@ class GoogleClient:
     def list_events(
         self, start: str | None = None, end: str | None = None, limit: int = 25
     ) -> list[dict[str, Any]]:
-        now = datetime.now().astimezone()
-        time_min = _to_rfc3339(start) if start else now.isoformat()
-        time_max = _to_rfc3339(end) if end else (now + timedelta(days=14)).isoformat()
+        now = datetime.now(_local_tz(self.tz))
+        time_min = _to_rfc3339(start, self.tz) if start else now.isoformat()
+        time_max = _to_rfc3339(end, self.tz) if end else (now + timedelta(days=14)).isoformat()
         result = (
             self._calendar.events()
             .list(
@@ -189,9 +193,9 @@ class GoogleClient:
         description: str = "",
         attendees: list[str] | None = None,
     ) -> dict[str, Any]:
-        start_block = _event_time(start)
+        start_block = _event_time(start, self.tz)
         if end:
-            end_block = _event_time(end)
+            end_block = _event_time(end, self.tz)
         elif "date" in start_block:
             end_block = dict(start_block)
         else:
