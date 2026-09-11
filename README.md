@@ -23,12 +23,25 @@ Requires Python 3.10+ and an Anthropic API key.
 ```bash
 git clone https://github.com/parsasalama6t/my-assistant
 cd my-assistant
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -e ".[web,google,dev]"   # or just `pip install -e .` for the CLI only
-cp .env.example .env             # then put your ANTHROPIC_API_KEY in .env
+cp .env.example .env                 # then put your ANTHROPIC_API_KEY in .env
 ```
 
-Alternatively export `ANTHROPIC_API_KEY` in your shell instead of using `.env`.
+On macOS the command is `python3`, not `python`. If `python3` is not found, install it with
+`brew install python` or from [python.org](https://www.python.org/downloads/) and rerun the steps.
+
+To add your key, open `.env` in a text editor (`open -e .env` on macOS) and replace `sk-ant-...`
+on the `ANTHROPIC_API_KEY=` line. Alternatively export `ANTHROPIC_API_KEY` in your shell.
+
+**Every time you use it** from a new terminal window, activate the environment first:
+
+```bash
+cd my-assistant
+source .venv/bin/activate
+my-assistant
+```
 
 ## Use it
 
