@@ -108,7 +108,8 @@ def test_late_recurring_is_skipped_but_late_custom_is_sent_with_prefix(store: St
     assert {s["id"] for s in report.skipped} == {recurring["id"], task["id"]}
     assert all(s["reason"] == "late" for s in report.skipped)
     assert [s["id"] for s in report.sent] == [one_shot["id"]]
-    assert sender.sent == [("telegram", "42", "(late, this was scheduled for 08:00) Call the bank")]
+    assert sender.sent[0] == ("telegram", "42", "(late, this was scheduled for 08:00) Call the bank")
+    assert len(sender.sent) == 2 and sender.sent[1][2].startswith("I was offline and missed 2 reminders")
     # Recurring row still moved on to tomorrow; task row is now disabled.
     assert store.get_schedule(recurring["id"])["next_run_utc"] == "2026-09-12T12:00:00+00:00"
     assert store.get_schedule(task["id"])["enabled"] == 0
@@ -506,3 +507,22 @@ def test_high_priority_task_gets_an_important_reminder(store: Store, voice_cfg: 
     sched.run_once()  # the sync must not disturb the pending escalation
     assert caller.calls == [("+14165550100", "Reminder: File taxes is due now.")]
     assert len(sender.sent) == 2
+
+
+def test_missed_reminders_are_summarised_in_one_text(store, config_tg=None) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from assistant.config import Config
+    from assistant.scheduler import Scheduler
+    from tests.fakes import FakeClock
+
+    config = Config(default_channel="telegram", telegram_bot_token="t", telegram_chat_ids=["1"], timezone="America/Toronto")
+    clock = FakeClock(datetime(2026, 9, 11, 19, 0, tzinfo=timezone.utc))
+    sent: list[tuple[str, str, str]] = []
+    sched = Scheduler(store, config, send=lambda c, i, t: sent.append((c, i, t)) or "m", render_briefing=lambda *a: "b", now_fn=clock.now)
+    store.add_schedule("task_reminder", "telegram", "1", "2026-09-11T19:00:00+00:00", "America/Toronto", text="Reminder: Class is due 15:00.", source="task:1")
+    clock.advance(minutes=6 * 60)  # the computer was asleep for six hours
+    report = sched.tick()
+    assert [s["reason"] for s in report.skipped] == ["late"]
+    assert len(report.notices) == 1 and report.sent == []
+    assert len(sent) == 1 and "missed 1 reminder" in sent[0][2] and "Class" in sent[0][2]

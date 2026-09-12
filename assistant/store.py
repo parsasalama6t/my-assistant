@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -119,6 +120,16 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
 )
 
 
+_SPACE_DT = re.compile(r"^(\d{4}-\d{2}-\d{2}) (\d{1,2}:\d{2})")
+
+
+def normalize_datetime(value: Any) -> Any:
+    """Turn 'YYYY-MM-DD HH:MM' into 'YYYY-MM-DDTHH:MM' so a time is always recognised."""
+    if isinstance(value, str):
+        return _SPACE_DT.sub(r"\1T\2", value.strip(), count=1)
+    return value
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -175,7 +186,7 @@ class Store:
         cur = self.conn.execute(
             "INSERT INTO tasks (title, notes, due, priority, status, created_at)"
             " VALUES (?, ?, ?, ?, 'open', ?)",
-            (title, notes or "", due or None, priority, now_iso()),
+            (title, notes or "", normalize_datetime(due) or None, priority, now_iso()),
         )
         self.conn.commit()
         return self.get_task(cur.lastrowid)  # type: ignore[arg-type]
@@ -207,6 +218,8 @@ class Store:
     def update_task(self, task_id: int, **fields: Any) -> dict[str, Any] | None:
         allowed = {"title", "notes", "due", "priority", "status"}
         updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+        if "due" in updates:
+            updates["due"] = normalize_datetime(updates["due"])
         if "priority" in updates and updates["priority"] not in PRIORITIES:
             raise ValueError(f"priority must be one of {PRIORITIES}")
         if "status" in updates and updates["status"] not in TASK_STATUSES:
@@ -290,7 +303,7 @@ class Store:
         cur = self.conn.execute(
             "INSERT INTO events (title, start, end, location, notes, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?)",
-            (title, start, end or None, location or "", notes or "", now_iso()),
+            (title, normalize_datetime(start), normalize_datetime(end) or None, location or "", notes or "", now_iso()),
         )
         self.conn.commit()
         return self.get_event(cur.lastrowid)  # type: ignore[arg-type]

@@ -44,6 +44,9 @@ right now, and schedule_message with priority "important" texts first and calls 
 if they don't reply, while "critical" calls and texts at once. Texts are the \
 default; reserve calls for things that genuinely matter (a flight, a deadline, \
 medication, "make sure I...") or when the user asks to be called.
+- If the user asks why a reminder or briefing didn't arrive, call delivery_log first \
+and answer from it: "skipped, missed beyond grace" means you were offline (the computer \
+running you was asleep or closed) when it was due. Offer to reschedule.
 """
 
 BRIEFING_PROMPT = (

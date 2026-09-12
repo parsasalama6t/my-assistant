@@ -689,6 +689,37 @@ VOICE_TOOLS: list[Tool] = [
 
 VOICE_TOOL_NAMES = {t.name for t in VOICE_TOOLS}
 
+def _delivery_log(ctx: ToolContext, args: dict[str, Any]) -> str:
+    from assistant.schedule_rules import format_local
+
+    rows = ctx.store.list_deliveries(int(args.get("limit") or 20))
+    out = []
+    for r in rows:
+        sched = ctx.store.get_schedule(r["schedule_id"]) if r.get("schedule_id") else None
+        out.append(
+            {
+                "when_local": format_local(r["fire_at_utc"], ctx.tz) if r.get("fire_at_utc") else None,
+                "status": r["status"],
+                "kind": r.get("kind"),
+                "text": (sched or {}).get("text", ""),
+                "reason": r.get("error"),
+            }
+        )
+    return _dump({"count": len(out), "deliveries": out, "note": "status 'skipped' with 'missed beyond grace' means the assistant was offline when it was due"})
+
+
+SCHEDULE_TOOLS.append(
+    Tool(
+        "delivery_log",
+        "Show which scheduled texts and calls were actually sent, skipped, or failed, with "
+        "the reason and local time. Use this before answering questions like 'why didn't I "
+        "get my 3pm reminder'. 'missed beyond grace' means the assistant was offline (for "
+        "example the computer was asleep) when it was due.",
+        _obj({"limit": {"type": "integer"}}),
+        _delivery_log,
+    )
+)
+
 TOOLS_BY_NAME: dict[str, Tool] = {
     t.name: t for t in [*TOOLS, *GOOGLE_TOOLS, *SCHEDULE_TOOLS, *VOICE_TOOLS]
 }

@@ -51,11 +51,13 @@ GOOGLE_LOOKAHEAD = timedelta(hours=36)
 class TickReport:
     sent: list[dict[str, Any]] = field(default_factory=list)
     skipped: list[dict[str, Any]] = field(default_factory=list)
+    notices: list[dict[str, Any]] = field(default_factory=list)  # e.g. the missed-reminder summary
     failed: list[dict[str, Any]] = field(default_factory=list)
 
     def __iadd__(self, other: "TickReport") -> "TickReport":
         self.sent += other.sent
         self.skipped += other.skipped
+        self.notices += getattr(other, "notices", [])
         self.failed += other.failed
         return self
 
@@ -158,7 +160,10 @@ class Scheduler:
             if lateness > self.grace:
                 if row["repeat"] or row["kind"] in SKIP_WHEN_LATE_KINDS:
                     self.store.finish_delivery(row["id"], fire_at_iso, "skipped", error="missed beyond grace")
-                    report.skipped.append(self._summary(row, reason="late", lateness_minutes=int(lateness.total_seconds() // 60)))
+                    report.skipped.append(self._summary(
+                        row, reason="late", lateness_minutes=int(lateness.total_seconds() // 60),
+                        text=row.get("text") or "", fire_at_local=fire_at.astimezone(self.tz).strftime("%a %H:%M"),
+                    ))
                     self.log.info("skipped late %s schedule %s (%s late)", row["kind"], row["id"], lateness)
                     continue
                 prefix = self._late_prefix(fire_at, now)
@@ -186,7 +191,35 @@ class Scheduler:
                 self._call_now(row, body, report)
             elif priority == "important":
                 self._schedule_escalation(row, fire_at_iso, body, now)
+        self._notify_missed(report)
         return report
+
+    def _notify_missed(self, report: TickReport) -> None:
+        """Tell the user, in one fixed text, which reminders were dropped while offline."""
+        missed = [s for s in report.skipped if s.get("reason") == "late" and s.get("source") != "already_claimed"]
+        missed = [m for m in missed if not str(m.get("source") or "").startswith("escalate:")]
+        if not missed:
+            return
+        target = self.config.default_target()
+        if target is None:
+            return
+        labels = {"briefing": "the morning briefing", "review": "the evening review"}
+        lines = []
+        for m in missed:
+            label = labels.get(m["kind"]) or (m.get("text") or m["kind"])
+            if m.get("via") == "call":
+                label += " (call)"
+            lines.append(f"- {label}, was due {m.get('fire_at_local', '')}".rstrip(", "))
+        text = (
+            f"I was offline and missed {len(missed)} reminder{'s' if len(missed) != 1 else ''}:\n"
+            + "\n".join(lines)
+            + "\nTell me if any of these still matter and I'll reschedule."
+        )
+        try:
+            self.send(target[0], target[1], text)
+            report.notices.append({"kind": "missed_summary", "count": len(missed), "text": text, "via": "text"})
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("could not send missed-reminder summary: %s", exc)
 
     # ---------------------------------------------------------------- calls
     def _fire_call(self, row: dict[str, Any], fire_at_iso: str, next_iso: str | None, report: TickReport) -> None:

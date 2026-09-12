@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from assistant.store import Store
-from assistant.tools import GOOGLE_TOOLS, TOOLS, ToolContext, run_tool, tool_definitions
+from assistant.tools import GOOGLE_TOOLS, SCHEDULE_TOOLS, TOOLS, ToolContext, run_tool, tool_definitions
 
 
 def test_definitions_are_well_formed() -> None:
@@ -86,13 +86,13 @@ def _messaging_config() -> Config:
 
 
 def test_scheduling_flag_adds_three_tools_and_default_unchanged() -> None:
-    assert len(SCHEDULE_TOOLS) == 3
+    assert len(SCHEDULE_TOOLS) == 4
     assert len(tool_definitions()) == len(TOOLS)
     names = {d["name"] for d in tool_definitions(scheduling=True)}
     assert {"schedule_message", "list_scheduled", "cancel_scheduled"} <= names
-    assert len(tool_definitions(scheduling=True)) == len(TOOLS) + 3
+    assert len(tool_definitions(scheduling=True)) == len(TOOLS) + 4
     assert "schedule_message" not in {d["name"] for d in tool_definitions()}
-    assert len(tool_definitions(google=True, scheduling=True, web_search=True)) == len(TOOLS) + len(GOOGLE_TOOLS) + 4
+    assert len(tool_definitions(google=True, scheduling=True, web_search=True)) == len(TOOLS) + len(GOOGLE_TOOLS) + 5
 
 
 def test_schedule_message_without_target_errors(store: Store) -> None:
@@ -213,7 +213,7 @@ def test_voice_flag_adds_call_me() -> None:
     with_voice = tool_definitions(voice=True)
     assert len(with_voice) == len(TOOLS) + 1 and with_voice[-1]["name"] == "call_me"
     everything = tool_definitions(google=True, scheduling=True, voice=True, web_search=True)
-    assert len(everything) == len(TOOLS) + len(GOOGLE_TOOLS) + 3 + 1 + 1
+    assert len(everything) == len(TOOLS) + len(GOOGLE_TOOLS) + len(SCHEDULE_TOOLS) + 1 + 1
     assert everything[-1]["name"] == "web_search" and everything[-2]["name"] == "call_me"
 
 
@@ -260,3 +260,23 @@ def test_call_me_uses_place_call_or_errors(store: Store) -> None:
 
     out, err = run_tool(ToolContext(store, config=_voice_config(), place_call=broken), "call_me", {"text": "hi"})
     assert err and "Twilio refused" in out
+
+
+def test_delivery_log_tool_lists_skipped_rows(store: Store) -> None:
+    from assistant.tools import SCHEDULE_TOOLS
+
+    assert any(t.name == "delivery_log" for t in SCHEDULE_TOOLS)
+    row = store.add_schedule("custom", "telegram", "1", "2026-09-11T19:00:00+00:00", "America/Toronto", text="Class reminder")
+    store.claim_delivery(row["id"], row["next_run_utc"])
+    store.finish_delivery(row["id"], row["next_run_utc"], "skipped", error="missed beyond grace")
+    out, err = run_tool(ToolContext(store), "delivery_log", {})
+    data = json.loads(out)
+    assert not err and data["deliveries"][0]["status"] == "skipped"
+    assert data["deliveries"][0]["text"] == "Class reminder" and "offline" in data["note"]
+
+
+def test_space_separated_due_is_normalised(store: Store) -> None:
+    t = store.add_task("Class", due="2026-09-11 15:00")
+    assert t["due"] == "2026-09-11T15:00"
+    e = store.add_event("Lunch", "2026-09-12 12:00", end="2026-09-12 13:00")
+    assert e["start"] == "2026-09-12T12:00" and e["end"] == "2026-09-12T13:00"

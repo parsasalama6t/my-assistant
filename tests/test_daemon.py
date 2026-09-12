@@ -81,7 +81,7 @@ def test_reply_is_sent_and_session_is_reused(store: Store, tg_config: Config) ->
     assert store.session_for_chat("telegram", "111", 3600) == session
     assert len(store.get_messages(session)) == 4
     assert len(client.calls[1]["messages"]) == 3  # history carried into the second turn
-    assert client.calls[0]["tools"][-1]["name"] == "cancel_scheduled"  # scheduling tools are on
+    assert "cancel_scheduled" in {t["name"] for t in client.calls[0]["tools"]}  # scheduling tools are on
 
     # A replayed update id is ignored.
     assert daemon.handle_inbound(inbound("again", message_id="2")) is None
